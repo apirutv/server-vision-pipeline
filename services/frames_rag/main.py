@@ -1,0 +1,397 @@
+# services/frames_rag/main.py
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple
+
+import httpx
+import faiss
+import numpy as np
+import uvicorn
+import yaml
+from fastapi import FastAPI, Query
+from pydantic import BaseModel
+
+from common.logging import get_logger
+
+# ---------------------------------------------------------------------
+# Config & logging
+# ---------------------------------------------------------------------
+ROOT = Path(__file__).resolve().parents[2]
+CFG_PATH = ROOT / "config" / "config.yaml"
+
+_cfg: Dict[str, Any] = yaml.safe_load(CFG_PATH.read_text(encoding="utf-8")) if CFG_PATH.exists() else {}
+_rt = _cfg.get("runtime", {}) or {}
+_rag = _cfg.get("frames_rag", {}) or {}
+
+LOG_LEVEL = _rt.get("log_level", "INFO")
+LOG_DIR   = Path(_rt.get("log_dir", "logs")).resolve()
+log = get_logger("frames_rag", log_dir=str(LOG_DIR), level=LOG_LEVEL)
+
+NDJSON = (ROOT / _rag.get("ndjson_path", "data/index/frames.ndjson")).resolve()
+DB     = (ROOT / _rag.get("db_path", "data/rag/frames.sqlite")).resolve()
+IDX    = (ROOT / _rag.get("faiss_path", "data/rag/faiss.index")).resolve()
+IDS    = (ROOT / _rag.get("ids_path", "data/rag/ids.json")).resolve()
+STATE  = (ROOT / _rag.get("state_path", "data/rag/state.json")).resolve()
+
+OLLAMA_URL  = str(_rag.get("ollama_url", "http://127.0.0.1:11434"))
+EMBED_MODEL = str(_rag.get("embed_model", "nomic-embed-text"))
+
+HOST = _rag.get("host", "0.0.0.0")
+PORT = int(_rag.get("port", 8080))
+
+log.info("Frames RAG: ndjson=%s db=%s faiss=%s ids=%s", NDJSON, DB, IDX, IDS)
+log.info("Ollama embedding: url=%s model=%s", OLLAMA_URL, EMBED_MODEL)
+
+app = FastAPI(title="Frames RAG")
+
+# ---------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------
+def _ensure_dirs():
+    for p in [DB.parent, IDX.parent, IDS.parent, STATE.parent]:
+        p.mkdir(parents=True, exist_ok=True)
+
+def _ensure_db():
+    _ensure_dirs()
+    with sqlite3.connect(DB) as cx:
+        cx.execute("""
+            CREATE TABLE IF NOT EXISTS frames(
+              id TEXT PRIMARY KEY,
+              ts INTEGER,
+              camera_id TEXT,
+              scene_text TEXT,
+              people TEXT,
+              pets TEXT,
+              vehicles TEXT,
+              objects TEXT,
+              blob TEXT
+            )
+        """)
+        cx.commit()
+
+def _load_ids() -> List[str]:
+    if IDS.exists():
+        try:
+            return json.loads(IDS.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return []
+
+def _save_ids(ids: List[str]):
+    IDS.write_text(json.dumps(ids, ensure_ascii=False), encoding="utf-8")
+
+def _load_state() -> Dict[str, Any]:
+    if STATE.exists():
+        try:
+            return json.loads(STATE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {"last_count": 0}
+
+def _save_state(st: Dict[str, Any]):
+    STATE.write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def _join_lines(val) -> str:
+    """
+    Normalize a field that may be str, list, dict, or None into a '\n'-joined string.
+    """
+    if val is None:
+        return ""
+    if isinstance(val, str):
+        return val
+    if isinstance(val, list):
+        out = []
+        for x in val:
+            if x is None:
+                continue
+            if isinstance(x, str):
+                out.append(x)
+            elif isinstance(x, dict):
+                for key in ("description", "label", "name", "text"):
+                    if key in x and x[key]:
+                        out.append(str(x[key]))
+                        break
+                else:
+                    out.append(json.dumps(x, ensure_ascii=False))
+            else:
+                out.append(str(x))
+        return "\n".join(out)
+    if isinstance(val, dict):
+        for key in ("description", "label", "name", "text"):
+            if key in val and val[key]:
+                return str(val[key])
+        return json.dumps(val, ensure_ascii=False)
+    return str(val)
+
+# ---------------------------------------------------------------------
+# Embeddings
+# ---------------------------------------------------------------------
+def _embed(texts: List[str]) -> np.ndarray:
+    if not texts:
+        return np.zeros((0, 768), dtype="float32")
+
+    vecs: List[np.ndarray] = []
+    with httpx.Client(timeout=90.0) as s:
+        for t in texts:
+            payload = {"model": EMBED_MODEL, "prompt": t}
+            r = s.post(f"{OLLAMA_URL}/api/embeddings", json=payload)
+            if r.status_code == 404:
+                log.error("Ollama /api/embeddings 404; ensure '%s' is pulled", EMBED_MODEL)
+                raise RuntimeError("Ollama /api/embeddings 404")
+            r.raise_for_status()
+            emb = r.json().get("embedding")
+            if not emb:
+                raise RuntimeError("Missing 'embedding' field in response")
+            vecs.append(np.asarray(emb, dtype="float32"))
+    return np.vstack(vecs)
+
+def _normalize_dense(X: np.ndarray) -> np.ndarray:
+    if X.size == 0:
+        return X
+    faiss.normalize_L2(X)
+    return X
+
+# ---------------------------------------------------------------------
+# NDJSON / SQLite
+# ---------------------------------------------------------------------
+def _iter_ndjson(start_line: int = 0) -> Tuple[int, List[Dict[str, Any]]]:
+    total = 0
+    recs: List[Dict[str, Any]] = []
+    if not NDJSON.exists():
+        return 0, []
+    with NDJSON.open("r", encoding="utf-8") as fh:
+        for idx, line in enumerate(fh):
+            total = idx + 1
+            if idx < start_line:
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                recs.append(json.loads(line))
+            except Exception:
+                continue
+    return total, recs
+
+def _upsert_records_to_sqlite(records: List[Dict[str, Any]]) -> Tuple[List[str], List[str]]:
+    ids: List[str] = []
+    dense_texts: List[str] = []
+    if not records:
+        return ids, dense_texts
+
+    with sqlite3.connect(DB) as cx:
+        cur = cx.cursor()
+        for rec in records:
+            fid = rec.get("frame_id") or ""
+            if not fid:
+                continue
+            ts_epoch = 0
+            ts_raw = rec.get("ts") or rec.get("indexed_at")
+            if ts_raw:
+                try:
+                    ts_epoch = int(datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")).timestamp())
+                except Exception:
+                    ts_epoch = 0
+
+            cam = rec.get("camera_id", "")
+            scene    = _join_lines(rec.get("scene_text", ""))
+            people   = _join_lines(rec.get("people", []))
+            pets     = _join_lines(rec.get("pets", []))
+            vehicles = _join_lines(rec.get("vehicles", []))
+            objects  = _join_lines(rec.get("objects", []))
+
+            cur.execute(
+                "INSERT OR REPLACE INTO frames VALUES (?,?,?,?,?,?,?,?,?)",
+                (fid, ts_epoch, cam, scene, people, pets, vehicles, objects, json.dumps(rec, ensure_ascii=False)),
+            )
+            ids.append(fid)
+            dense_texts.append("\n".join([scene, people, pets, vehicles, objects]))
+        cx.commit()
+    return ids, dense_texts
+
+# ---------------------------------------------------------------------
+# Rebuild / Refresh
+# ---------------------------------------------------------------------
+def rebuild() -> Dict[str, Any]:
+    """Full rebuild: rewrite SQLite + FAISS + ids + state."""
+    if not NDJSON.exists():
+        msg = f"NDJSON not found: {NDJSON}"
+        log.error(msg)
+        return {"status": "error", "message": msg}
+
+    log.info("Rebuilding RAG index from %s", NDJSON)
+    t0 = time.time()
+    _ensure_db()
+
+    with sqlite3.connect(DB) as cx:
+        cx.execute("DELETE FROM frames")
+        cx.commit()
+
+    total_lines, records = _iter_ndjson(start_line=0)
+    if not records:
+        log.warning("No records in NDJSON.")
+        _save_ids([])
+        _save_state({"last_count": total_lines})
+        return {"status": "ok", "count": 0, "sec": round(time.time() - t0, 2)}
+
+    rec_ids, dense_texts = _upsert_records_to_sqlite(records)
+    X = _normalize_dense(_embed(dense_texts))
+    index = faiss.IndexFlatIP(X.shape[1])
+    index.add(X)
+    faiss.write_index(index, str(IDX))
+    _save_ids(rec_ids)
+    _save_state({"last_count": total_lines})
+
+    sec = round(time.time() - t0, 2)
+    log.info("Rebuilt %d vectors (dim=%d) in %.2fs", len(rec_ids), X.shape[1], sec)
+    return {"status": "ok", "count": len(rec_ids), "dim": X.shape[1], "sec": sec}
+
+def refresh() -> Dict[str, Any]:
+    """Tail-only refresh: index new NDJSON lines since last rebuild/refresh."""
+    if not NDJSON.exists():
+        msg = f"NDJSON not found: {NDJSON}"
+        log.error(msg)
+        return {"status": "error", "message": msg}
+
+    if not IDX.exists() or not IDS.exists():
+        log.warning("No FAISS/ids found; doing full rebuild")
+        return rebuild()
+
+    st = _load_state()
+    last_count = int(st.get("last_count", 0))
+    total_lines, new_records = _iter_ndjson(start_line=last_count)
+    if not new_records:
+        log.info("No new records to refresh (last_count=%d, total=%d)", last_count, total_lines)
+        _save_state({"last_count": total_lines})
+        return {"status": "ok", "added": 0, "total": total_lines}
+
+    log.info("Refreshing RAG: %d new records (lines %d→%d)", len(new_records), last_count, total_lines)
+
+    rec_ids_new, dense_texts = _upsert_records_to_sqlite(new_records)
+    if not rec_ids_new:
+        _save_state({"last_count": total_lines})
+        return {"status": "ok", "added": 0, "total": total_lines}
+
+    all_ids = _load_ids()
+    X_new = _normalize_dense(_embed(dense_texts))
+
+    index = faiss.read_index(str(IDX))
+    index.add(X_new)
+    faiss.write_index(index, str(IDX))
+
+    all_ids.extend(rec_ids_new)
+    _save_ids(all_ids)
+    _save_state({"last_count": total_lines})
+
+    log.info("Refresh complete: +%d vectors, total lines=%d", len(rec_ids_new), total_lines)
+    return {"status": "ok", "added": len(rec_ids_new), "total": total_lines}
+
+# ---------------------------------------------------------------------
+# Dense search helpers
+# ---------------------------------------------------------------------
+class SearchOut(BaseModel):
+    results: List[Dict[str, Any]]
+
+def _query_dense(q: str, k: int) -> List[str]:
+    if not IDX.exists() or not IDS.exists():
+        return []
+    index = faiss.read_index(str(IDX))
+    all_ids = _load_ids()
+    qv = _normalize_dense(_embed([q]))
+    D, I = index.search(qv, max(k * 5, k))
+    return [all_ids[i] for i in I[0] if 0 <= i < len(all_ids)]
+
+def _fetch_metadata(ids: List[str]) -> List[Dict[str, Any]]:
+    if not ids:
+        return []
+    placeholders = ",".join(["?"] * len(ids))
+    with sqlite3.connect(DB) as cx:
+        cx.row_factory = sqlite3.Row
+        rows = cx.execute(f"SELECT * FROM frames WHERE id IN ({placeholders})", ids).fetchall()
+        return [dict(r) for r in rows]
+
+# ---------------------------------------------------------------------
+# HTTP endpoints
+# ---------------------------------------------------------------------
+@app.get("/rag/rebuild")
+def http_rebuild():
+    t0 = time.time()
+    res = rebuild()
+    res["sec"] = res.get("sec", round(time.time() - t0, 2))
+    return res
+
+@app.get("/rag/refresh")
+def http_refresh():
+    t0 = time.time()
+    res = refresh()
+    res["sec"] = res.get("sec", round(time.time() - t0, 2))
+    return res
+
+@app.get("/rag/search", response_model=SearchOut)
+def http_search(
+    q: str = Query(..., description="query text"),
+    start: Optional[int] = None,
+    end: Optional[int] = None,
+    cameras: Optional[str] = None,
+    k: int = Query(10, ge=1, le=100),
+    strict: bool = Query(False, description="if true, apply keyword filter on text fields"),
+):
+    log.info("search q='%s' k=%d cameras=%s strict=%s", q, k, cameras, strict)
+    cand_ids = _query_dense(q, k)
+    if not cand_ids:
+        return {"results": []}
+
+    meta = _fetch_metadata(cand_ids)
+    cams = set(cameras.split(",")) if cameras else None
+
+    tokens = [t.lower() for t in q.split() if t.strip()]
+
+    def _matches_text(r: dict) -> bool:
+        if not strict or not tokens:
+            return True
+        text_fields = [
+            r.get("scene_text") or "",
+            r.get("people") or "",
+            r.get("pets") or "",
+            r.get("vehicles") or "",
+            r.get("objects") or "",
+        ]
+        blob = " ".join(text_fields).lower()
+        return any(tok in blob for tok in tokens)
+
+    out: List[Dict[str, Any]] = []
+    for r in meta:
+        if start is not None and int(r["ts"]) < int(start):
+            continue
+        if end is not None and int(r["ts"]) > int(end):
+            continue
+        if cams and r["camera_id"] not in cams:
+            continue
+        if not _matches_text(r):
+            continue
+
+        try:
+            blob = json.loads(r["blob"])
+        except Exception:
+            blob = None
+        if blob:
+            out.append(blob)
+        if len(out) >= k:
+            break
+
+    return {"results": out}
+
+# ---------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------
+if __name__ == "__main__":
+    log.info("Frames RAG starting on %s:%d", HOST, PORT)
+    _ensure_db()
+    uvicorn.run("services.frames_rag.main:app", host=HOST, port=PORT,
+                reload=False, log_level=LOG_LEVEL.lower())

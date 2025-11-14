@@ -1,0 +1,1258 @@
+# services/vision_web/main.py
+from __future__ import annotations
+
+import json
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple
+
+import httpx
+import uvicorn
+import yaml
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+
+from common.logging import get_logger
+
+# ---------------------------------------------------------------------
+# Config & logging
+# ---------------------------------------------------------------------
+ROOT = Path(__file__).resolve().parents[2]
+CFG_PATH = ROOT / "config" / "config.yaml"
+CAM_CFG_PATH = ROOT / "config" / "cameras.yaml"
+
+cfg: Dict[str, Any] = yaml.safe_load(CFG_PATH.read_text(encoding="utf-8")) if CFG_PATH.exists() else {}
+rt = cfg.get("runtime", {}) or {}
+rag_cfg = cfg.get("frames_rag", {}) or {}
+vw_cfg = cfg.get("vision_web", {}) or cfg.get("vision_endpoints", {}) or {}
+
+LOG_LEVEL = rt.get("log_level", "INFO")
+LOG_DIR = rt.get("log_dir", "logs")
+log = get_logger("vision_web", log_dir=LOG_DIR, level=LOG_LEVEL)
+
+LANDING_BASE = (ROOT / rt.get("ingest_base", "data/landing")).resolve()
+NDJSON = (ROOT / rag_cfg.get("ndjson_path", "data/index/frames.ndjson")).resolve()
+
+RAG_HOST = rag_cfg.get("host", "127.0.0.1")
+RAG_PORT = int(rag_cfg.get("port", 8080))
+RAG_URL = f"http://{RAG_HOST}:{RAG_PORT}"
+
+WEB_HOST = vw_cfg.get("host", "0.0.0.0")
+WEB_PORT = int(vw_cfg.get("port", 8090))
+
+# ---------------------------------------------------------------------
+# LLM provider config
+# ---------------------------------------------------------------------
+LLM_MODE = (vw_cfg.get("llm_mode") or "local").lower().strip()  # "local" or "openai"
+
+# Local (Ollama)
+OLLAMA_URL = vw_cfg.get("ollama_url", "http://127.0.0.1:11434")
+LOCAL_MODEL = vw_cfg.get("local_model", "gpt-oss:latest")
+
+# OpenAI
+OPENAI_MODEL = vw_cfg.get("openai_model", "gpt-4.1-mini")
+OPENAI_API_KEY = vw_cfg.get("openai_api_key", None)
+
+# ---------------------------------------------------------------------
+# LLM debug storage
+# ---------------------------------------------------------------------
+LAST_LLM_DEBUG: Dict[str, Any] = {
+    "provider": "",
+    "system_prompt": "",
+    "user_payload": "",
+    "request": "",
+    "raw_response": "",
+    "parsed_json": "",
+    "error": "",
+}
+
+# ---------------------------------------------------------------------
+# Camera list
+# ---------------------------------------------------------------------
+def _load_cameras() -> List[Dict[str, str]]:
+    cams: List[Dict[str, str]] = []
+    if CAM_CFG_PATH.exists():
+        try:
+            cam_cfg = yaml.safe_load(CAM_CFG_PATH.read_text(encoding="utf-8")) or {}
+            for c in cam_cfg.get("cameras", []):
+                cid = c.get("id")
+                if not cid:
+                    continue
+                name = c.get("name") or cid
+                cams.append({"id": cid, "name": name})
+        except Exception as e:
+            log.warning("Failed to load cameras.yaml: %s", e)
+
+    if not cams and NDJSON.exists():
+        seen: set[str] = set()
+        with NDJSON.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                cid = rec.get("camera_id")
+                if cid and cid not in seen:
+                    seen.add(cid)
+                    cams.append({"id": cid, "name": cid})
+    return cams
+
+
+CAMERAS = _load_cameras()
+CAMERAS_JSON = json.dumps(CAMERAS, ensure_ascii=False)
+
+app = FastAPI(title="Server Vision Pipeline · Vision Console")
+
+# ---------------------------------------------------------------------
+# HTML templates
+# ---------------------------------------------------------------------
+
+INDEX_HTML = """<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Server Vision Pipeline</title>
+  <style>
+    body {
+      background:#111; color:#eee;
+      font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+      margin:24px;
+    }
+    a { color:#66ccff; text-decoration:none; font-size:1.0rem; }
+    a:hover { text-decoration:underline; }
+    h1 { color:#00c6ff; margin-bottom:8px; }
+    .meta { color:#9aa0a6; font-size:0.9rem; margin-bottom:16px; }
+    ul { list-style:none; padding:0; }
+    li { margin-bottom:8px; }
+  </style>
+</head>
+<body>
+  <h1>Server Vision Pipeline</h1>
+  <div class="meta">
+    RAG: <span style="font-family:monospace;">__RAG_URL__</span> ·
+    Landing: <span style="font-family:monospace;">__LANDING__</span>
+  </div>
+  <ul>
+    <li>➜ <a href="/browse">Browse Frames</a></li>
+    <li>➜ <a href="/search">Search Frames (RAG + LLM)</a></li>
+    <li>➜ <a href="/debug">LLM Debug Viewer</a></li>
+  </ul>
+</body>
+</html>
+"""
+
+BROWSE_HTML = """<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Browse Frames · Server Vision Pipeline</title>
+  <style>
+    body {
+      background:#111; color:#eee;
+      font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+      margin:24px;
+    }
+    nav a { color:#66ccff; margin-right:16px; text-decoration:none; }
+    nav a:hover { text-decoration:underline; }
+    h1 { color:#00c6ff; margin-bottom:4px; }
+    .meta { color:#9aa0a6; font-size:0.9rem; margin-bottom:16px; }
+    label { margin-right:4px; }
+    input[type="date"], select {
+      background:#1a1a1a; border:1px solid #333; color:#eee; border-radius:4px; padding:4px 8px;
+    }
+    button {
+      background:#00c6ff; border:none; color:#000; padding:5px 10px; border-radius:4px; cursor:pointer;
+      font-size:0.9rem; font-weight:600; margin-left:4px;
+    }
+    button:hover { background:#00a0d2; }
+    .frame-grid {
+      display:grid;
+      grid-template-columns:repeat(auto-fit,minmax(280px,1fr));
+      grid-gap:16px;
+      margin-top:16px;
+    }
+    .card {
+      background:#1a1a1a;
+      border-radius:8px;
+      padding:10px;
+      display:flex;
+      flex-direction:column;
+      gap:8px;
+    }
+    .card-header { font-weight:600; color:#66ccff; }
+    .card-meta { font-size:0.85rem; color:#bbb; }
+    .thumbs { display:flex; gap:8px; }
+    .thumbs img { max-width:140px; border-radius:4px; border:1px solid #333; cursor:pointer; }
+    pre { white-space:pre-wrap; font-family:system-ui, sans-serif; font-size:0.85rem; margin:0; }
+    .pill { padding:2px 6px; border-radius:999px; font-size:0.75rem; margin-right:6px; }
+    .pill.person { background:#2e7d32; color:#e8f5e9; }
+    .pill.pet { background:#f9a825; color:#212121; }
+    .pill.vehicle { background:#1565c0; color:#e3f2fd; }
+    .error { color:#ef5350; margin-top:8px; }
+    .modal {
+      position:fixed; left:0; top:0; width:100%; height:100%;
+      background:rgba(0,0,0,0.8);
+      display:none; align-items:center; justify-content:center; z-index:1000;
+    }
+    .modal-inner { max-width:90%; max-height:90%; }
+    .modal-inner img { width:100%; border-radius:4px; }
+    .modal-close { text-align:right; margin-bottom:6px; }
+    .modal-close button { background:#333; color:#eee; border:none; padding:4px 8px; border-radius:4px; }
+  </style>
+</head>
+<body>
+  <nav>
+    <a href="/">Home</a>
+    <a href="/browse">Browse</a>
+    <a href="/search">Search</a>
+    <a href="/debug">Debug</a>
+  </nav>
+  <h1>Browse Frames</h1>
+  <div class="meta">
+    Landing: <span style="font-family:monospace;">__LANDING__</span>
+  </div>
+
+  <div class="controls">
+    <label>Date:</label><input id="browse-date" type="date"/>
+    <label>Camera:</label>
+    <select id="browse-camera">
+      <option value="">All cameras</option>
+    </select>
+    <button id="browse-btn">Load</button>
+  </div>
+  <div id="browse-error" class="error"></div>
+  <div id="browse-grid" class="frame-grid"></div>
+
+  <div id="modal" class="modal">
+    <div class="modal-inner">
+      <div class="modal-close"><button id="modal-close">Close</button></div>
+      <img id="modal-img" src="" alt="preview"/>
+    </div>
+  </div>
+
+<script>
+const CAMERAS = __CAMERAS_JSON__;
+
+function byId(id){ return document.getElementById(id); }
+
+function initCameras(){
+  const sel = byId('browse-camera');
+  CAMERAS.forEach(c=>{
+    const opt=document.createElement('option');
+    opt.value=c.id;
+    opt.textContent=c.id + (c.name && c.name!==c.id ? " · "+c.name : "");
+    sel.appendChild(opt);
+  });
+}
+
+function esc(s){
+  if(s===null||s===undefined) return '';
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+
+function cardHTML(f){
+  const fid=esc(f.frame_id);
+  const cam=esc(f.camera_id||"");
+  const ts =esc(f.ts||"");
+  const scene=esc(f.scene_text||"");
+  const people=(f.people||[]).map(p=>"- "+esc(p)).join("\\n");
+  const pets  =(f.pets||[]).map(p=>"- "+esc(p)).join("\\n");
+  const veh   =(f.vehicles||[]).map(p=>"- "+esc(p)).join("\\n");
+
+  let pills="";
+  if(f.person_present)pills+='<span class="pill person">person</span>';
+  if(f.pet_present)pills+='<span class="pill pet">pet</span>';
+  if(f.vehicles_present)pills+='<span class="pill vehicle">vehicle</span>';
+
+  return `
+    <div class="card">
+      <div class="card-header">${cam || "(no camera)"} · ${fid}</div>
+      <div class="card-meta">${ts}</div>
+      <div>${pills}</div>
+      <div class="thumbs">
+        <img src="/media/frame/${fid}" data-src="/media/frame/${fid}">
+        <img src="/media/tagged/${fid}" data-src="/media/tagged/${fid}">
+      </div>
+      <div><strong>Scene:</strong><br><pre>${scene}</pre></div>
+      ${people ? `<div><strong>People:</strong><br><pre>${people}</pre></div>`:""}
+      ${pets   ? `<div><strong>Pets:</strong><br><pre>${pets}</pre></div>`:""}
+      ${veh    ? `<div><strong>Vehicles:</strong><br><pre>${veh}</pre></div>`:""}
+    </div>`;
+}
+
+function attachThumbHandlers(){
+  document.querySelectorAll('.thumbs img').forEach(img=>{
+    img.addEventListener('click',()=>{
+      byId('modal-img').src=img.dataset.src;
+      byId('modal').style.display='flex';
+    });
+  });
+}
+
+byId('modal-close').addEventListener('click',()=>{byId('modal').style.display='none';});
+
+byId('browse-btn').addEventListener('click', async ()=>{
+  const date=byId('browse-date').value;
+  const cam=byId('browse-camera').value;
+  const err=byId('browse-error');
+  const grid=byId('browse-grid');
+  err.textContent="";
+  grid.innerHTML="";
+
+  if(!date){
+    err.textContent="Please select a date.";
+    return;
+  }
+
+  const params=new URLSearchParams({date});
+  if(cam)params.append("camera_id",cam);
+
+  try{
+    const res=await fetch("/api/browse/frames?"+params.toString());
+    if(!res.ok)throw new Error(await res.text());
+    const data=await res.json();
+    const frames=data.frames||[];
+    if(!frames.length){
+      err.textContent="No frames found for this date/camera.";
+      return;
+    }
+    grid.innerHTML=frames.map(cardHTML).join("");
+    attachThumbHandlers();
+  }catch(e){
+    err.textContent="Error: "+e;
+  }
+});
+
+window.addEventListener('load',initCameras);
+</script>
+</body>
+</html>
+"""
+
+SEARCH_HTML = """<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Search Frames · Server Vision Pipeline</title>
+  <style>
+    body {
+      background:#111; color:#eee;
+      font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+      margin:24px;
+    }
+    nav a { color:#66ccff; margin-right:16px; text-decoration:none; }
+    nav a:hover { text-decoration:underline; }
+    h1 { color:#00c6ff; margin-bottom:4px; }
+    .meta { color:#9aa0a6; font-size:0.9rem; margin-bottom:16px; }
+    .controls {
+      margin-bottom:12px;
+      display:flex; flex-wrap:wrap; gap:12px; align-items:center;
+    }
+    label { margin-right:4px; }
+    input[type="text"] {
+      background:#1a1a1a; border:1px solid #333; color:#eee; border-radius:4px; padding:4px 8px;
+    }
+    input[type="checkbox"] { margin-left:4px; }
+    button {
+      background:#00c6ff; border:none; color:#000; padding:5px 10px; border-radius:4px; cursor:pointer;
+      font-size:0.9rem; font-weight:600;
+    }
+    button:hover { background:#00a0d2; }
+    button:disabled { opacity:0.5; cursor:not-allowed; }
+
+    .frame-grid {
+      display:grid;
+      grid-template-columns:repeat(auto-fit,minmax(280px,1fr));
+      grid-gap:16px;
+      margin-top:12px;
+    }
+    .card {
+      background:#1a1a1a;
+      border-radius:8px;
+      padding:10px;
+      display:flex;
+      flex-direction:column;
+      gap:8px;
+    }
+    .card-header { font-weight:600; color:#66ccff; }
+    .card-meta { font-size:0.85rem; color:#bbb; }
+    .thumbs { display:flex; gap:8px; }
+    .thumbs img { max-width:140px; border-radius:4px; border:1px solid #333; cursor:pointer; }
+    pre { white-space:pre-wrap; font-family:system-ui, sans-serif; font-size:0.85rem; margin:0; }
+    .pill { padding:2px 6px; border-radius:999px; font-size:0.75rem; margin-right:6px; }
+    .pill.person { background:#2e7d32; color:#e8f5e9; }
+    .pill.pet { background:#f9a825; color:#212121; }
+    .pill.vehicle { background:#1565c0; color:#e3f2fd; }
+    .error { color:#ef5350; margin-top:8px; }
+    .summary {
+      margin: 8px 0 16px 0;
+      padding: 8px 12px;
+      background:#1a1a1a;
+      border-radius:6px;
+      color:#ddd;
+      font-size:0.9rem;
+    }
+    .summary strong { color:#ffeb3b; }
+
+    .modal {
+      position:fixed; left:0; top:0; width:100%; height:100%; background:rgba(0,0,0,0.8);
+      display:none; align-items:center; justify-content:center; z-index:1000;
+    }
+    .modal-inner {
+      background:#111;
+      max-width:95%;
+      max-height:95%;
+      border-radius:8px;
+      padding:12px;
+      display:flex;
+      flex-direction:column;
+      box-shadow:0 0 12px rgba(0,0,0,0.8);
+    }
+    .modal-inner img { width:100%; border-radius:4px; }
+    .modal-close { text-align:right; margin-bottom:6px; }
+    .modal-close button { background:#333; color:#eee; border:none; padding:4px 8px; border-radius:4px; }
+
+    .debug-container {
+      flex:1;
+      overflow:auto;
+      border:1px solid #333;
+      border-radius:6px;
+      padding:8px;
+      background:#000;
+      font-family:monospace;
+      font-size:0.8rem;
+      color:#eee;
+    }
+    .tree-node { margin-left:8px; }
+    .tree-header {
+      cursor:pointer;
+      user-select:none;
+      white-space:nowrap;
+    }
+    .tree-header span.key {
+      color:#81d4fa;
+    }
+    .tree-header span.type {
+      color:#9ccc65;
+      margin-left:6px;
+      font-size:0.75rem;
+    }
+    .tree-toggle {
+      display:inline-block;
+      width:1em;
+    }
+    .tree-children {
+      margin-left:14px;
+      border-left:1px dotted #444;
+      padding-left:6px;
+      display:none;
+    }
+  </style>
+</head>
+<body>
+  <nav>
+    <a href="/">Home</a>
+    <a href="/browse">Browse</a>
+    <a href="/search">Search</a>
+    <a href="/debug">Debug</a>
+  </nav>
+  <h1>Search Frames (RAG + LLM)</h1>
+  <div class="meta">
+    RAG: <span class="mono">__RAG_URL__</span>
+  </div>
+
+  <div class="controls">
+    <label>Query:</label>
+    <input id="search-q" type="text" style="width:320px;" placeholder="e.g. red car, person carrying a baby, people eating at dining table"/>
+    <label>Camera:</label>
+    <input id="search-camera" type="text" placeholder="optional camera id"/>
+    <label>LLM assisted:</label>
+    <input id="search-llm" type="checkbox" checked/>
+    <label>Show Debug Modal:</label>
+    <input id="search-debug-toggle" type="checkbox"/>
+    <button id="search-btn">Search</button>
+    <button id="open-debug-btn" disabled>Open Debug Viewer</button>
+  </div>
+  <div id="search-error" class="error"></div>
+  <div id="search-summary" class="summary" style="display:none;"></div>
+  <div id="search-grid" class="frame-grid"></div>
+
+  <div id="modal" class="modal">
+    <div class="modal-inner">
+      <div class="modal-close"><button id="modal-close">Close</button></div>
+      <img id="modal-img" src="" alt="preview"/>
+    </div>
+  </div>
+
+  <div id="debug-modal" class="modal">
+    <div class="modal-inner">
+      <div class="modal-close"><button id="debug-modal-close">Close</button></div>
+      <div class="debug-container" id="debug-tree-container">
+        Loading debug...
+      </div>
+    </div>
+  </div>
+
+<script>
+function byId(id) { return document.getElementById(id); }
+
+function esc(s) {
+  if (s === null || s === undefined) return '';
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+
+function cardHTML(f) {
+  const fid = esc(f.frame_id);
+  const cam = esc(f.camera_id || "");
+  const ts  = esc(f.ts || "");
+  const scene = esc(f.scene_text || "");
+  const people = (f.people || []).map(p => "- " + esc(p)).join("\\n");
+  const pets   = (f.pets || []).map(p => "- " + esc(p)).join("\\n");
+  const veh    = (f.vehicles || []).map(p => "- " + esc(p)).join("\\n");
+
+  let pills = "";
+  if (f.person_present)   pills += '<span class="pill person">person</span>';
+  if (f.pet_present)      pills += '<span class="pill pet">pet</span>';
+  if (f.vehicles_present) pills += '<span class="pill vehicle">vehicle</span>';
+
+  return `
+    <div class="card" data-fid="${fid}">
+      <div class="card-header">${cam || "(no camera)"} · ${fid}</div>
+      <div class="card-meta">${ts}</div>
+      <div>${pills}</div>
+      <div class="thumbs">
+        <img src="/media/frame/${fid}" data-src="/media/frame/${fid}" alt="frame">
+        <img src="/media/tagged/${fid}" data-src="/media/tagged/${fid}" alt="tagged">
+      </div>
+      <div><strong>Scene:</strong><br><pre>${scene}</pre></div>
+      ${people ? `<div><strong>People:</strong><br><pre>${people}</pre></div>` : ""}
+      ${pets   ? `<div><strong>Pets:</strong><br><pre>${pets}</pre></div>`     : ""}
+      ${veh    ? `<div><strong>Vehicles:</strong><br><pre>${veh}</pre></div>`  : ""}
+    </div>
+  `;
+}
+
+function attachThumbHandlers(containerId) {
+  const grid = byId(containerId);
+  grid.querySelectorAll('img').forEach(img => {
+    img.addEventListener('click', () => {
+      const src = img.getAttribute('data-src') || img.src;
+      const m   = byId('modal');
+      const mi  = byId('modal-img');
+      mi.src = src;
+      m.style.display = 'flex';
+    });
+  });
+}
+
+byId('modal-close').addEventListener('click', () => {
+  byId('modal').style.display = 'none';
+});
+
+// JSON tree viewer
+function isObject(val) {
+  return val && typeof val === 'object' && !Array.isArray(val);
+}
+
+function isArray(val) {
+  return Array.isArray(val);
+}
+
+function createTreeNode(key, value) {
+  const node = document.createElement('div');
+  node.className = 'tree-node';
+
+  const header = document.createElement('div');
+  header.className = 'tree-header';
+
+  const toggle = document.createElement('span');
+  toggle.className = 'tree-toggle';
+
+  const keySpan = document.createElement('span');
+  keySpan.className = 'key';
+  keySpan.textContent = key === null ? '(root)' : key;
+
+  const typeSpan = document.createElement('span');
+  typeSpan.className = 'type';
+
+  const childrenContainer = document.createElement('div');
+  childrenContainer.className = 'tree-children';
+
+  const complex = isObject(value) || isArray(value);
+
+  if (complex) {
+    toggle.textContent = '▸';
+    typeSpan.textContent = isArray(value) ? 'Array[' + value.length + ']' : 'Object';
+    header.appendChild(toggle);
+    header.appendChild(keySpan);
+    header.appendChild(typeSpan);
+
+    const entries = isArray(value) ? value.entries() : Object.entries(value);
+    for (const [k, v] of entries) {
+      const child = createTreeNode(String(k), v);
+      childrenContainer.appendChild(child);
+    }
+
+    header.addEventListener('click', () => {
+      const visible = childrenContainer.style.display === 'block';
+      childrenContainer.style.display = visible ? 'none' : 'block';
+      toggle.textContent = visible ? '▸' : '▾';
+    });
+  } else {
+    toggle.textContent = '';
+    typeSpan.textContent = typeof value;
+    header.appendChild(toggle);
+    header.appendChild(keySpan);
+    header.appendChild(typeSpan);
+
+    const leaf = document.createElement('span');
+    leaf.style.marginLeft = '8px';
+    leaf.textContent = ' = ' + String(value);
+    header.appendChild(leaf);
+  }
+
+  node.appendChild(header);
+  if (complex) {
+    node.appendChild(childrenContainer);
+  }
+  return node;
+}
+
+function renderJsonTree(data, containerId) {
+  const container = byId(containerId);
+  container.innerHTML = '';
+  if (data === null || data === undefined) {
+    container.textContent = 'No debug data available.';
+    return;
+  }
+  const root = createTreeNode(null, data);
+  container.appendChild(root);
+}
+
+let lastDebug = null;
+
+function openDebugModal() {
+  renderJsonTree(lastDebug, 'debug-tree-container');
+  byId('debug-modal').style.display = 'flex';
+}
+
+byId('debug-modal-close').addEventListener('click', () => {
+  byId('debug-modal').style.display = 'none';
+});
+
+byId('open-debug-btn').addEventListener('click', () => {
+  if (lastDebug) openDebugModal();
+});
+
+byId('search-btn').addEventListener('click', async () => {
+  const q   = byId('search-q').value.trim();
+  const cam = byId('search-camera').value.trim();
+  const llm = byId('search-llm').checked;
+  const showDebug = byId('search-debug-toggle').checked;
+  const err = byId('search-error');
+  const grid = byId('search-grid');
+  const summary = byId('search-summary');
+  const debugBtn = byId('open-debug-btn');
+
+  err.textContent = "";
+  grid.innerHTML = "";
+  summary.style.display = "none";
+  summary.textContent = "";
+  debugBtn.disabled = true;
+  lastDebug = null;
+
+  if (!q) {
+    err.textContent = "Please enter a query.";
+    return;
+  }
+
+  const params = new URLSearchParams({ q, k: "40" });
+  if (cam) params.append("cameras", cam);
+  if (llm) params.append("llm", "true");
+
+  try {
+    const res = await fetch("/api/search?" + params.toString());
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    const frames = data.frames || [];
+    if (!frames.length) {
+      err.textContent = "No results from RAG.";
+    } else {
+      grid.innerHTML = frames.map(cardHTML).join("");
+      attachThumbHandlers("search-grid");
+    }
+    if (data.summary) {
+      summary.style.display = "block";
+      summary.innerHTML = "<strong>LLM Summary:</strong> " + data.summary;
+    }
+    if (data.debug) {
+      lastDebug = data.debug;
+      debugBtn.disabled = false;
+      if (llm && showDebug) {
+        openDebugModal();
+      }
+    }
+  } catch (e) {
+    err.textContent = "Search error: " + e;
+  }
+});
+</script>
+</body>
+</html>
+"""
+
+DEBUG_HTML = """<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>LLM Debug · Server Vision Pipeline</title>
+  <style>
+    body {
+      background:#111; color:#eee;
+      font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+      margin:24px;
+    }
+    nav a { color:#66ccff; margin-right:16px; text-decoration:none; }
+    nav a:hover { text-decoration:underline; }
+    h1 { color:#00c6ff; margin-bottom:8px; }
+    .meta { color:#9aa0a6; font-size:0.9rem; margin-bottom:12px; }
+    .debug-container {
+      border:1px solid #333;
+      border-radius:6px;
+      padding:8px;
+      background:#000;
+      font-family:monospace;
+      font-size:0.8rem;
+      color:#eee;
+      max-height:80vh;
+      overflow:auto;
+    }
+    .tree-node { margin-left:8px; }
+    .tree-header {
+      cursor:pointer;
+      user-select:none;
+      white-space:nowrap;
+    }
+    .tree-header span.key {
+      color:#81d4fa;
+    }
+    .tree-header span.type {
+      color:#9ccc65;
+      margin-left:6px;
+      font-size:0.75rem;
+    }
+    .tree-toggle {
+      display:inline-block;
+      width:1em;
+    }
+    .tree-children {
+      margin-left:14px;
+      border-left:1px dotted #444;
+      padding-left:6px;
+      display:none;
+    }
+  </style>
+</head>
+<body>
+  <nav>
+    <a href="/">Home</a>
+    <a href="/browse">Browse</a>
+    <a href="/search">Search</a>
+    <a href="/debug">Debug</a>
+  </nav>
+  <h1>Latest LLM Debug Session</h1>
+  <div class="meta">Shows the most recent LLM rerank + summary call.</div>
+  <div id="debug-container" class="debug-container">Loading...</div>
+
+<script>
+function byId(id){ return document.getElementById(id); }
+function isObject(v){ return v && typeof v==="object" && !Array.isArray(v); }
+function isArray(v){ return Array.isArray(v); }
+
+function createTreeNode(key,value){
+  const node=document.createElement('div');
+  node.className='tree-node';
+
+  const header=document.createElement('div');
+  header.className='tree-header';
+
+  const toggle=document.createElement('span');
+  toggle.className='tree-toggle';
+
+  const keySpan=document.createElement('span');
+  keySpan.className='key';
+  keySpan.textContent=key===null?'(root)':key;
+
+  const typeSpan=document.createElement('span');
+  typeSpan.className='type';
+
+  const kids=document.createElement('div');
+  kids.className='tree-children';
+
+  const complex=isObject(value)||isArray(value);
+
+  if(complex){
+    toggle.textContent='▸';
+    typeSpan.textContent=isArray(value)?'Array['+value.length+']':'Object';
+    header.appendChild(toggle);
+    header.appendChild(keySpan);
+    header.appendChild(typeSpan);
+
+    const entries=isArray(value)?value.entries():Object.entries(value);
+    for(const [k,v] of entries){
+      kids.appendChild(createTreeNode(String(k),v));
+    }
+
+    header.addEventListener('click',()=>{
+      const vis=kids.style.display==='block';
+      kids.style.display=vis?'none':'block';
+      toggle.textContent=vis?'▸':'▾';
+    });
+  }else{
+    toggle.textContent='';
+    typeSpan.textContent=typeof value;
+    header.appendChild(toggle);
+    header.appendChild(keySpan);
+    header.appendChild(typeSpan);
+    const leaf=document.createElement('span');
+    leaf.style.marginLeft='8px';
+    leaf.textContent=' = '+String(value);
+    header.appendChild(leaf);
+  }
+
+  node.appendChild(header);
+  if(complex) node.appendChild(kids);
+  return node;
+}
+
+function renderTree(data){
+  const c=byId('debug-container');
+  c.innerHTML='';
+  if(data===null||data===undefined){
+    c.textContent='No debug data yet.';
+    return;
+  }
+  c.appendChild(createTreeNode(null,data));
+}
+
+async function loadDebug(){
+  try{
+    const res=await fetch('/api/debug/llm');
+    if(!res.ok){
+      byId('debug-container').textContent='Error: '+(await res.text());
+      return;
+    }
+    const data=await res.json();
+    renderTree(data);
+  }catch(e){
+    byId('debug-container').textContent='Error: '+e;
+  }
+}
+loadDebug();
+</script>
+</body>
+</html>
+"""
+
+# ---------------------------------------------------------------------
+# NDJSON helpers (again, used below)
+# ---------------------------------------------------------------------
+def _iter_ndjson(start_line: int = 0) -> Tuple[int, List[Dict[str, Any]]]:
+    total = 0
+    recs: List[Dict[str, Any]] = []
+    if not NDJSON.exists():
+        return 0, []
+    with NDJSON.open("r", encoding="utf-8") as fh:
+        for idx, line in enumerate(fh):
+            total = idx + 1
+            if idx < start_line:
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                recs.append(json.loads(line))
+            except Exception:
+                continue
+    return total, recs
+
+
+def _date_from_rec(rec: Dict[str, Any]) -> Optional[str]:
+    ts_raw = rec.get("ts") or rec.get("indexed_at")
+    if not ts_raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")).astimezone()
+        return dt.date().isoformat()
+    except Exception:
+        return None
+
+
+def _find_record(fid: str) -> Optional[Dict[str, Any]]:
+    if not NDJSON.exists():
+        return None
+    with NDJSON.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if rec.get("frame_id") == fid:
+                return rec
+    return None
+
+
+def _resolve_media(rec: Dict[str, Any], key: str) -> Optional[Path]:
+    files = rec.get("files") or {}
+    p = files.get(key)
+    if not p:
+        return None
+    pth = (ROOT / p).resolve()
+    return pth if pth.exists() else None
+
+
+def _shape_frame(rec: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "frame_id": rec.get("frame_id"),
+        "camera_id": rec.get("camera_id"),
+        "ts": rec.get("ts") or rec.get("indexed_at"),
+        "scene_text": rec.get("scene_text"),
+        "person_present": rec.get("person_present"),
+        "pet_present": rec.get("pet_present"),
+        "vehicles_present": rec.get("vehicles_present"),
+        "people": rec.get("people") or [],
+        "pets": rec.get("pets") or [],
+        "vehicles": rec.get("vehicles") or [],
+    }
+
+# ---------------------------------------------------------------------
+# LLM providers + router + ranking
+# ---------------------------------------------------------------------
+async def _call_local_ollama(system_prompt: str, user_payload: Dict[str, Any]) -> str:
+    global LAST_LLM_DEBUG
+    request_body = {
+        "model": LOCAL_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+        ],
+        "stream": False,
+    }
+    LAST_LLM_DEBUG["provider"] = "local_ollama"
+    LAST_LLM_DEBUG["request"] = request_body
+    LAST_LLM_DEBUG["raw_response"] = ""
+
+    log.info(f"[OLLAMA CALL] model={LOCAL_MODEL}")
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(f"{OLLAMA_URL}/api/chat", json=request_body)
+            resp.raise_for_status()
+            data = resp.json()
+            text = (data.get("message") or {}).get("content") or ""
+            LAST_LLM_DEBUG["raw_response"] = text
+            return text
+    except Exception as e:
+        LAST_LLM_DEBUG["error"] = f"Ollama error: {e}"
+        log.warning("Ollama error: %s", e)
+        return ""
+
+
+# vvvvvvvvvv
+
+async def _call_openai(system_prompt: str, user_payload: Dict[str, Any]) -> str:
+    global LAST_LLM_DEBUG
+    if not OPENAI_API_KEY:
+        LAST_LLM_DEBUG["error"] = "Missing OPENAI_API_KEY"
+        log.warning("OpenAI mode selected but no API key configured")
+        return ""
+    
+    api_body = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+        ],
+        "response_format": {"type": "json_object"},
+    }
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    LAST_LLM_DEBUG["provider"] = "openai"
+    LAST_LLM_DEBUG["request"] = api_body
+    LAST_LLM_DEBUG["raw_response"] = ""
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=api_body
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            text = data["choices"][0]["message"]["content"]
+            usage = data.get("usage", {})
+
+            # Store in debug viewer
+            LAST_LLM_DEBUG["raw_response"] = text
+            LAST_LLM_DEBUG["usage"] = usage
+            LAST_LLM_DEBUG["model"] = OPENAI_MODEL
+
+            # Print logging
+            log.info(
+                f"[OPENAI CALL] model={OPENAI_MODEL} "
+                f"prompt={usage.get('prompt_tokens')} "
+                f"completion={usage.get('completion_tokens')} "
+                f"total={usage.get('total_tokens')}"
+            )
+
+            return text
+
+    except Exception as e:
+        LAST_LLM_DEBUG["error"] = f"OpenAI error: {e}"
+        log.warning(f"OpenAI error: {e}")
+        return ""
+
+    
+# ^^^^^^^^^^
+
+
+async def call_llm(system_prompt: str, user_payload: Dict[str, Any]) -> str:
+    global LAST_LLM_DEBUG
+    LAST_LLM_DEBUG["system_prompt"] = system_prompt
+    LAST_LLM_DEBUG["user_payload"] = user_payload
+    LAST_LLM_DEBUG["error"] = ""
+    if LLM_MODE == "openai":
+        text = await _call_openai(system_prompt, user_payload)
+        if text:
+            return text
+        log.warning("OpenAI failed, falling back to local")
+        return await _call_local_ollama(system_prompt, user_payload)
+    return await _call_local_ollama(system_prompt, user_payload)
+
+
+def try_extract_json(raw: str) -> Optional[Dict[str, Any]]:
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        if raw.startswith("{") and raw.endswith("}"):
+            return json.loads(raw)
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start != -1 and end != -1:
+            return json.loads(raw[start : end + 1])
+    except Exception:
+        return None
+    return None
+
+
+async def _llm_rerank_and_summarize(query: str, frames: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], str]:
+    from copy import deepcopy
+    global LAST_LLM_DEBUG
+
+    if not frames:
+        return frames, ""
+
+    # candidates = []
+    # for f in frames:
+    #     candidates.append({
+    #         "frame_id": f.get("frame_id"),
+    #         "camera_id": f.get("camera_id"),
+    #         "ts": f.get("ts"),
+    #         "scene_text": (f.get("scene_text") or "")[:400],
+    #         "people": f.get("people") or [],
+    #         "pets": f.get("pets") or [],
+    #         "vehicles": f.get("vehicles") or [],
+    #     })
+
+    candidates = []
+    for f in frames:
+        raw_scene = f.get("scene_text") or ""
+
+        # Try to load the JSON scene_text and strip objects[]
+        try:
+            st = json.loads(raw_scene)
+            if isinstance(st, dict) and "objects" in st:
+                st.pop("objects", None)   # Remove the heavy list
+            cleaned_scene = json.dumps(st, ensure_ascii=False)
+        except Exception:
+            # If not JSON, fallback to plain raw text
+            cleaned_scene = raw_scene
+
+        candidates.append({
+            "frame_id": f.get("frame_id"),
+            "camera_id": f.get("camera_id"),
+            "ts": f.get("ts"),
+            # Send trimmed + object-free scene
+            "scene_text": cleaned_scene[:300],
+            "people": f.get("people") or [],
+            "pets": f.get("pets") or [],
+            "vehicles": f.get("vehicles") or [],
+        })
+
+
+    system_prompt = (
+        "You are an assistant that ranks and summarizes camera search results.\n"
+        "You get a list of candidate frames (frame_id, camera_id, ts, scene_text, people, pets, vehicles)\n"
+        "and a user query (could be in Thai or English).\n\n"
+        "1) Rank the frame_ids from MOST relevant to LEAST relevant.\n"
+        "2) Produce a short human-readable summary.\n\n"
+        "Output STRICT JSON ONLY in this format:\n"
+        "{\"ordered_frame_ids\": [\"id1\",\"id2\",...], \"summary\": \"...\"}\n"
+        "If the user's query is Thai, write the summary in Thai; else use English.\n"
+        "Do NOT include any other keys or text outside this JSON.\n"
+    )
+
+    user_payload = {"query": query, "candidates": deepcopy(candidates)}
+
+    raw_text = await call_llm(system_prompt, user_payload)
+    if not raw_text:
+        return frames, ""
+
+    parsed = try_extract_json(raw_text)
+    LAST_LLM_DEBUG["parsed_json"] = parsed
+
+    if not parsed:
+        LAST_LLM_DEBUG["error"] = "Failed to parse JSON from LLM"
+        return frames, raw_text[:400]
+
+    order = parsed.get("ordered_frame_ids") or []
+    summary = parsed.get("summary") or ""
+
+    if not order:
+        return frames, summary
+
+    order_index = {fid: i for i, fid in enumerate(order)}
+
+    def sort_key(f: Dict[str, Any]) -> int:
+        fid = f.get("frame_id")
+        return order_index.get(fid, len(order_index) + 1)
+
+    frames_sorted = sorted(frames, key=sort_key)
+    return frames_sorted, summary
+
+# ---------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    html = INDEX_HTML.replace("__RAG_URL__", RAG_URL).replace("__LANDING__", str(LANDING_BASE))
+    return HTMLResponse(html)
+
+
+@app.get("/browse", response_class=HTMLResponse)
+async def browse_page():
+    html = BROWSE_HTML.replace("__LANDING__", str(LANDING_BASE)).replace("__CAMERAS_JSON__", CAMERAS_JSON)
+    return HTMLResponse(html)
+
+
+@app.get("/search", response_class=HTMLResponse)
+async def search_page():
+    html = SEARCH_HTML.replace("__RAG_URL__", RAG_URL)
+    return HTMLResponse(html)
+
+
+@app.get("/debug", response_class=HTMLResponse)
+async def debug_page():
+    return HTMLResponse(DEBUG_HTML)
+
+
+@app.get("/api/browse/frames", response_class=JSONResponse)
+async def api_browse_frames(
+    date: str = Query(...),
+    camera_id: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=500),
+):
+    total, recs = _iter_ndjson(0)
+    _ = total
+    out: List[Dict[str, Any]] = []
+    for rec in recs:
+        d = _date_from_rec(rec)
+        if d != date:
+            continue
+        if camera_id and rec.get("camera_id") != camera_id:
+            continue
+        out.append(_shape_frame(rec))
+        if len(out) >= limit:
+            break
+    return JSONResponse({"frames": out})
+
+
+@app.get("/api/search", response_class=JSONResponse)
+async def api_search(
+    q: str = Query(...),
+    cameras: Optional[str] = None,
+    llm: bool = Query(False),
+    k: int = Query(40, ge=1, le=100),
+):
+    params = {"q": q, "k": str(k), "strict": "true"}
+    if cameras:
+        params["cameras"] = cameras
+
+    log.info("Vision search q=%s cameras=%s llm=%s", q, cameras, llm)
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.get(f"{RAG_URL}/rag/search", params=params)
+            r.raise_for_status()
+            payload = r.json()
+    except Exception as e:
+        log.error("RAG search error: %s", e)
+        raise HTTPException(status_code=502, detail=f"RAG search error: {e}")
+
+    frames = [_shape_frame(rec) for rec in payload.get("results", [])]
+    summary = ""
+    debug_payload: Any = None
+
+    if llm and frames:
+        frames, summary = await _llm_rerank_and_summarize(q, frames)
+        frames = frames[:12]
+        debug_payload = LAST_LLM_DEBUG
+
+    return JSONResponse({"frames": frames, "summary": summary, "debug": debug_payload})
+
+
+@app.get("/api/debug/llm", response_class=JSONResponse)
+async def api_debug_llm():
+    return JSONResponse(LAST_LLM_DEBUG)
+
+
+@app.get("/media/frame/{frame_id}")
+async def media_frame(frame_id: str):
+    rec = _find_record(frame_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="frame_id not found")
+    p = _resolve_media(rec, "frame")
+    if not p:
+        raise HTTPException(status_code=404, detail="frame.jpg not found")
+    return FileResponse(p, media_type="image/jpeg")
+
+
+@app.get("/media/tagged/{frame_id}")
+async def media_tagged(frame_id: str):
+    rec = _find_record(frame_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="frame_id not found")
+    p = _resolve_media(rec, "tagged")
+    if not p:
+        raise HTTPException(status_code=404, detail="tagged.jpg not found")
+    return FileResponse(p, media_type="image/jpeg")
+
+
+# ---------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------
+if __name__ == "__main__":
+    log.info("Vision web starting on %s:%d (LLM_MODE=%s)", WEB_HOST, WEB_PORT, LLM_MODE)
+    uvicorn.run(
+        "services.vision_web.main:app",
+        host=WEB_HOST,
+        port=WEB_PORT,
+        reload=False,
+        log_level=LOG_LEVEL.lower(),
+    )

@@ -1,0 +1,107 @@
+# server-vision-pipeline/services/ingest_api/main.py
+from __future__ import annotations
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.responses import JSONResponse
+from pathlib import Path
+from typing import Optional
+import os, json, yaml
+from datetime import datetime
+import uvicorn
+from common.logging import get_logger
+
+# ------------------ Config & logging ------------------
+ROOT = Path(__file__).resolve().parents[2]
+CFG_PATH = ROOT / "config" / "config.yaml"
+cfg = yaml.safe_load(open(CFG_PATH, "r"))
+
+rt = cfg.get("runtime", {}) or {}
+HOST       = rt.get("host", "0.0.0.0")
+PORT       = int(rt.get("port", 8000))
+REDIS_URL  = rt.get("redis_url", "redis://127.0.0.1:6379/0")
+INGEST_BASE = Path(rt.get("ingest_base", "/srv/ingest/landing"))
+LOG_LEVEL  = rt.get("log_level", "INFO")
+LOG_DIR    = rt.get("log_dir", "logs")
+
+os.environ["LOG_LEVEL"] = LOG_LEVEL  # allow get_logger to pick from env if no level passed
+log = get_logger("ingest_api", log_dir=LOG_DIR, level=LOG_LEVEL)
+
+# ------------------ App ------------------
+app = FastAPI(title="server-vision-pipeline :: Ingest API")
+
+def _save_file(dst: Path, file: Optional[UploadFile]) -> int:
+    if not file:
+        return 0
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with dst.open("wb") as f:
+        for chunk in iter(lambda: file.file.read(1024 * 1024), b""):
+            if not chunk:
+                break
+            f.write(chunk)
+    return dst.stat().st_size
+
+# vvvvvvvvvv
+
+@app.post("/api/ingest/frame")
+async def ingest_frame(
+    manifest: str = Form(...),
+    frame: Optional[UploadFile] = File(None),
+    tagged: Optional[UploadFile] = File(None),
+    detections: Optional[UploadFile] = File(None),
+    description: Optional[UploadFile] = File(None),
+):
+    try:
+        man = json.loads(manifest)
+    except Exception as e:
+        log.error(f"Invalid manifest payload: {e}")
+        raise HTTPException(status_code=400, detail="invalid manifest")
+
+    frame_id  = (man.get("frame_id") or "unknown").strip()
+    camera_id = (man.get("camera_id") or "unknown").strip()
+    ts_str    = (man.get("ts") or datetime.utcnow().isoformat())
+
+    try:
+        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).astimezone()
+    except Exception:
+        dt = datetime.utcnow()
+
+    out_dir = INGEST_BASE / dt.strftime("%Y/%m/%d") / camera_id / frame_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # write manifest safely
+    (out_dir / "manifest.json").write_text(json.dumps(man, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def save_file(dst: Path, f: Optional[UploadFile]) -> int:
+        if not f:
+            return 0
+        with dst.open("wb") as fp:
+            for chunk in iter(lambda: f.file.read(1024 * 1024), b""):
+                if not chunk:
+                    break
+                fp.write(chunk)
+        return dst.stat().st_size
+
+    saved = {
+        "frame":       save_file(out_dir / "frame.jpg",        frame),
+        "tagged":      save_file(out_dir / "tagged.jpg",       tagged),
+        "detections":  save_file(out_dir / "detections.json",  detections),
+        "description": save_file(out_dir / "description.json", description),
+    }
+
+    log.info(f"[ingest] camera={camera_id} frame={frame_id} saved={saved} → {out_dir}")
+    return {"status": "ok", "saved": saved, "dir": str(out_dir)}
+
+
+   
+
+# ^^^^^^^^^^
+
+# tiny helper to avoid mypy complaining about write(str)
+def cast_bytes(s: str) -> bytes:
+    if isinstance(s, bytes):
+        return s
+    return s.encode("utf-8")
+
+# ------------------ Entrypoint ------------------
+if __name__ == "__main__":
+    log.info(f"Starting ingest_api on {HOST}:{PORT} base={INGEST_BASE} log_dir={LOG_DIR}")
+    uvicorn.run("services.ingest_api.main:app", host=HOST, port=PORT, reload=False, log_level=LOG_LEVEL.lower())

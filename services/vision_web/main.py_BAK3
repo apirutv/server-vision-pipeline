@@ -1,0 +1,784 @@
+# services/vision_web/main.py
+from __future__ import annotations
+
+import json
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple
+
+import httpx
+import uvicorn
+import yaml
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+
+from common.logging import get_logger
+
+# ---------------------------------------------------------------------
+# Config & logging
+# ---------------------------------------------------------------------
+ROOT = Path(__file__).resolve().parents[2]
+CFG_PATH = ROOT / "config" / "config.yaml"
+CAM_CFG_PATH = ROOT / "config" / "cameras.yaml"
+
+cfg: Dict[str, Any] = yaml.safe_load(CFG_PATH.read_text(encoding="utf-8")) if CFG_PATH.exists() else {}
+rt = cfg.get("runtime", {}) or {}
+rag_cfg = cfg.get("frames_rag", {}) or {}
+vw_cfg = cfg.get("vision_web", {}) or cfg.get("vision_endpoints", {}) or {}
+
+LOG_LEVEL = rt.get("log_level", "INFO")
+LOG_DIR = rt.get("log_dir", "logs")
+log = get_logger("vision_web", log_dir=LOG_DIR, level=LOG_LEVEL)
+
+LANDING_BASE = (ROOT / rt.get("ingest_base", "data/landing")).resolve()
+NDJSON = (ROOT / rag_cfg.get("ndjson_path", "data/index/frames.ndjson")).resolve()
+
+RAG_HOST = rag_cfg.get("host", "127.0.0.1")
+RAG_PORT = int(rag_cfg.get("port", 8080))
+RAG_URL = f"http://{RAG_HOST}:{RAG_PORT}"
+
+OLLAMA_URL = rag_cfg.get("ollama_url", "http://127.0.0.1:11434")
+LLM_MODEL = vw_cfg.get("llm_model", "gpt-oss:latest")  # default to GPT-OSS
+
+WEB_HOST = vw_cfg.get("host", "0.0.0.0")
+WEB_PORT = int(vw_cfg.get("port", 8090))
+
+# ---------------------------------------------------------------------
+# Camera list
+# ---------------------------------------------------------------------
+def _load_cameras() -> List[Dict[str, str]]:
+    cams: List[Dict[str, str]] = []
+    if CAM_CFG_PATH.exists():
+        try:
+            cam_cfg = yaml.safe_load(CAM_CFG_PATH.read_text(encoding="utf-8")) or {}
+            for c in cam_cfg.get("cameras", []):
+                cid = c.get("id")
+                if not cid:
+                    continue
+                name = c.get("name") or cid
+                cams.append({"id": cid, "name": name})
+        except Exception as e:
+            log.warning("Failed to load cameras.yaml: %s", e)
+    if not cams and NDJSON.exists():
+        seen: set[str] = set()
+        with NDJSON.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                cid = rec.get("camera_id")
+                if cid and cid not in seen:
+                    seen.add(cid)
+                    cams.append({"id": cid, "name": cid})
+    return cams
+
+
+CAMERAS = _load_cameras()
+CAMERAS_JSON = json.dumps(CAMERAS, ensure_ascii=False)
+
+app = FastAPI(title="Server Vision Pipeline · Vision Console")
+
+# ---------------------------------------------------------------------
+# HTML templates (separate pages for Browse and Search)
+# ---------------------------------------------------------------------
+
+INDEX_HTML = """<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Server Vision Pipeline</title>
+  <style>
+    body {
+      background:#111; color:#eee;
+      font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+      margin:24px;
+    }
+    a { color:#66ccff; text-decoration:none; font-size:1.0rem; }
+    a:hover { text-decoration:underline; }
+    h1 { color:#00c6ff; margin-bottom:8px; }
+    .meta { color:#9aa0a6; font-size:0.9rem; margin-bottom:16px; }
+    ul { list-style:none; padding:0; }
+    li { margin-bottom:8px; }
+  </style>
+</head>
+<body>
+  <h1>Server Vision Pipeline</h1>
+  <div class="meta">
+    RAG: <span style="font-family:monospace;">__RAG_URL__</span> ·
+    Landing: <span style="font-family:monospace;">__LANDING__</span>
+  </div>
+  <ul>
+    <li>➜ <a href="/browse">Browse Frames</a></li>
+    <li>➜ <a href="/search">Search Frames (RAG + LLM)</a></li>
+  </ul>
+</body>
+</html>
+"""
+
+BROWSE_HTML = """<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Browse Frames · Server Vision Pipeline</title>
+  <style>
+    body {
+      background:#111; color:#eee;
+      font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+      margin:24px;
+    }
+    nav a { color:#66ccff; margin-right:16px; text-decoration:none; }
+    nav a:hover { text-decoration:underline; }
+    h1 { color:#00c6ff; margin-bottom:4px; }
+    .meta { color:#9aa0a6; font-size:0.9rem; margin-bottom:16px; }
+    label { margin-right:4px; }
+    input[type="date"], select {
+      background:#1a1a1a; border:1px solid #333; color:#eee; border-radius:4px; padding:4px 8px;
+    }
+    button {
+      background:#00c6ff; border:none; color:#000; padding:5px 10px; border-radius:4px; cursor:pointer;
+      font-size:0.9rem; font-weight:600; margin-left:4px;
+    }
+    button:hover { background:#00a0d2; }
+    .frame-grid {
+      display:grid;
+      grid-template-columns:repeat(auto-fit,minmax(280px,1fr));
+      grid-gap:16px;
+      margin-top:16px;
+    }
+    .card {
+      background:#1a1a1a;
+      border-radius:8px;
+      padding:10px;
+      display:flex;
+      flex-direction:column;
+      gap:8px;
+    }
+    .card-header { font-weight:600; color:#66ccff; }
+    .card-meta { font-size:0.85rem; color:#bbb; }
+    .thumbs { display:flex; gap:8px; }
+    .thumbs img { max-width:140px; border-radius:4px; border:1px solid #333; cursor:pointer; }
+    pre { white-space:pre-wrap; font-family:system-ui, sans-serif; font-size:0.85rem; margin:0; }
+    .pill { padding:2px 6px; border-radius:999px; font-size:0.75rem; margin-right:6px; }
+    .pill.person { background:#2e7d32; color:#e8f5e9; }
+    .pill.pet { background:#f9a825; color:#212121; }
+    .pill.vehicle { background:#1565c0; color:#e3f2fd; }
+    .error { color:#ef5350; margin-top:8px; }
+    .modal {
+      position:fixed; left:0; top:0; width:100%; height:100%; background:rgba(0,0,0,0.8);
+      display:none; align-items:center; justify-content:center; z-index:1000;
+    }
+    .modal-inner { max-width:90%; max-height:90%; }
+    .modal-inner img { width:100%; border-radius:4px; }
+    .modal-close { text-align:right; margin-bottom:6px; }
+    .modal-close button { background:#333; color:#eee; border:none; padding:4px 8px; border-radius:4px; }
+  </style>
+</head>
+<body>
+  <nav>
+    <a href="/">Home</a>
+    <a href="/browse">Browse</a>
+    <a href="/search">Search</a>
+  </nav>
+  <h1>Browse Frames</h1>
+  <div class="meta">
+    Landing: <span style="font-family:monospace;">__LANDING__</span>
+  </div>
+
+  <div class="controls">
+    <label>Date:</label><input id="browse-date" type="date"/>
+    <label>Camera:</label>
+    <select id="browse-camera">
+      <option value="">All cameras</option>
+    </select>
+    <button id="browse-btn">Load</button>
+  </div>
+  <div id="browse-error" class="error"></div>
+  <div id="browse-grid" class="frame-grid"></div>
+
+  <div id="modal" class="modal">
+    <div class="modal-inner">
+      <div class="modal-close"><button id="modal-close">Close</button></div>
+      <img id="modal-img" src="" alt="preview"/>
+    </div>
+  </div>
+
+<script>
+const CAMERAS = __CAMERAS_JSON__;
+
+function byId(id) { return document.getElementById(id); }
+
+function initCameras() {
+  const sel = byId('browse-camera');
+  CAMERAS.forEach(c => {
+    const opt = document.createElement('option');
+    opt.value = c.id;
+    opt.textContent = c.id + (c.name && c.name !== c.id ? " · " + c.name : "");
+    sel.appendChild(opt);
+  });
+}
+
+function esc(s) {
+  if (s === null || s === undefined) return '';
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+
+function cardHTML(f) {
+  const fid = esc(f.frame_id);
+  const cam = esc(f.camera_id || "");
+  const ts  = esc(f.ts || "");
+  const scene = esc(f.scene_text || "");
+  const people = (f.people || []).map(p => "- " + esc(p)).join("\\n");
+  const pets   = (f.pets || []).map(p => "- " + esc(p)).join("\\n");
+  const veh    = (f.vehicles || []).map(p => "- " + esc(p)).join("\\n");
+
+  let pills = "";
+  if (f.person_present)   pills += '<span class="pill person">person</span>';
+  if (f.pet_present)      pills += '<span class="pill pet">pet</span>';
+  if (f.vehicles_present) pills += '<span class="pill vehicle">vehicle</span>';
+
+  return `
+    <div class="card" data-fid="${fid}">
+      <div class="card-header">${cam || "(no camera)"} · ${fid}</div>
+      <div class="card-meta">${ts}</div>
+      <div>${pills}</div>
+      <div class="thumbs">
+        <img src="/media/frame/${fid}" data-src="/media/frame/${fid}" alt="frame">
+        <img src="/media/tagged/${fid}" data-src="/media/tagged/${fid}" alt="tagged">
+      </div>
+      <div><strong>Scene:</strong><br><pre>${scene}</pre></div>
+      ${people ? `<div><strong>People:</strong><br><pre>${people}</pre></div>` : ""}
+      ${pets   ? `<div><strong>Pets:</strong><br><pre>${pets}</pre></div>`     : ""}
+      ${veh    ? `<div><strong>Vehicles:</strong><br><pre>${veh}</pre></div>`  : ""}
+    </div>
+  `;
+}
+
+function attachThumbHandlers(containerId) {
+  const grid = byId(containerId);
+  grid.querySelectorAll('img').forEach(img => {
+    img.addEventListener('click', () => {
+      const src = img.getAttribute('data-src') || img.src;
+      const m   = byId('modal');
+      const mi  = byId('modal-img');
+      mi.src = src;
+      m.style.display = 'flex';
+    });
+  });
+}
+
+byId('modal-close').addEventListener('click', () => {
+  byId('modal').style.display = 'none';
+});
+
+byId('browse-btn').addEventListener('click', async () => {
+  const date = byId('browse-date').value;
+  const cam  = byId('browse-camera').value;
+  const err  = byId('browse-error');
+  const grid = byId('browse-grid');
+
+  err.textContent = "";
+  grid.innerHTML = "";
+
+  if (!date) {
+    err.textContent = "Please select a date.";
+    return;
+  }
+
+  const params = new URLSearchParams({ date });
+  if (cam) params.append("camera_id", cam);
+
+  try {
+    const res = await fetch("/api/browse/frames?" + params.toString());
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    const frames = data.frames || [];
+    if (!frames.length) {
+      err.textContent = "No frames found for this date/camera.";
+      return;
+    }
+    grid.innerHTML = frames.map(cardHTML).join("");
+    attachThumbHandlers("browse-grid");
+  } catch (e) {
+    err.textContent = "Error loading frames: " + e;
+  }
+});
+
+window.addEventListener('load', initCameras);
+</script>
+</body>
+</html>
+"""
+
+SEARCH_HTML = """<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Search Frames · Server Vision Pipeline</title>
+  <style>
+    body {
+      background:#111; color:#eee;
+      font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+      margin:24px;
+    }
+    nav a { color:#66ccff; margin-right:16px; text-decoration:none; }
+    nav a:hover { text-decoration:underline; }
+    h1 { color:#00c6ff; margin-bottom:4px; }
+    .meta { color:#9aa0a6; font-size:0.9rem; margin-bottom:16px; }
+    .controls { margin-bottom:10px; }
+    label { margin-right:4px; }
+    input[type="text"] {
+      background:#1a1a1a; border:1px solid #333; color:#eee; border-radius:4px; padding:4px 8px;
+    }
+    button {
+      background:#00c6ff; border:none; color:#000; padding:5px 10px; border-radius:4px; cursor:pointer;
+      font-size:0.9rem; font-weight:600; margin-left:4px;
+    }
+    button:hover { background:#00a0d2; }
+    .frame-grid {
+      display:grid;
+      grid-template-columns:repeat(auto-fit,minmax(280px,1fr));
+      grid-gap:16px;
+    }
+    .card {
+      background:#1a1a1a;
+      border-radius:8px;
+      padding:10px;
+      display:flex;
+      flex-direction:column;
+      gap:8px;
+    }
+    .card-header { font-weight:600; color:#66ccff; }
+    .card-meta { font-size:0.85rem; color:#bbb; }
+    .thumbs { display:flex; gap:8px; }
+    .thumbs img { max-width:140px; border-radius:4px; border:1px solid #333; cursor:pointer; }
+    pre { white-space:pre-wrap; font-family:system-ui, sans-serif; font-size:0.85rem; margin:0; }
+    .pill { padding:2px 6px; border-radius:999px; font-size:0.75rem; margin-right:6px; }
+    .pill.person { background:#2e7d32; color:#e8f5e9; }
+    .pill.pet { background:#f9a825; color:#212121; }
+    .pill.vehicle { background:#1565c0; color:#e3f2fd; }
+    .error { color:#ef5350; margin-top:8px; }
+    .summary {
+      margin: 8px 0 16px 0;
+      padding: 8px 12px;
+      background:#1a1a1a;
+      border-radius:6px;
+      color:#ddd;
+      font-size:0.9rem;
+    }
+    .summary strong { color:#ffeb3b; }
+    .modal {
+      position:fixed; left:0; top:0; width:100%; height:100%; background:rgba(0,0,0,0.8);
+      display:none; align-items:center; justify-content:center; z-index:1000;
+    }
+    .modal-inner { max-width:90%; max-height:90%; }
+    .modal-inner img { width:100%; border-radius:4px; }
+    .modal-close { text-align:right; margin-bottom:6px; }
+    .modal-close button { background:#333; color:#eee; border:none; padding:4px 8px; border-radius:4px; }
+  </style>
+</head>
+<body>
+  <nav>
+    <a href="/">Home</a>
+    <a href="/browse">Browse</a>
+    <a href="/search">Search</a>
+  </nav>
+  <h1>Search Frames (RAG)</h1>
+  <div class="meta">
+    RAG: <span class="mono">__RAG_URL__</span>
+  </div>
+
+  <div class="controls">
+    <label>Query:</label>
+    <input id="search-q" type="text" style="width:320px;" placeholder="e.g. red car, person carrying a baby, people eating at dining table"/>
+    <label>Camera:</label>
+    <input id="search-camera" type="text" placeholder="optional camera id"/>
+    <label>LLM assisted:</label>
+    <input id="search-llm" type="checkbox" checked/>
+    <button id="search-btn">Search</button>
+  </div>
+  <div id="search-error" class="error"></div>
+  <div id="search-summary" class="summary" style="display:none;"></div>
+  <div id="search-grid" class="frame-grid"></div>
+
+  <div id="modal" class="modal">
+    <div class="modal-inner">
+      <div class="modal-close"><button id="modal-close">Close</button></div>
+      <img id="modal-img" src="" alt="preview"/>
+    </div>
+  </div>
+
+<script>
+function byId(id) { return document.getElementById(id); }
+
+function esc(s) {
+  if (s === null || s === undefined) return '';
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+
+function cardHTML(f) {
+  const fid = esc(f.frame_id);
+  const cam = esc(f.camera_id || "");
+  const ts  = esc(f.ts || "");
+  const scene = esc(f.scene_text || "");
+  const people = (f.people || []).map(p => "- " + esc(p)).join("\\n");
+  const pets   = (f.pets || []).map(p => "- " + esc(p)).join("\\n");
+  const veh    = (f.vehicles || []).map(p => "- " + esc(p)).join("\\n");
+
+  let pills = "";
+  if (f.person_present)   pills += '<span class="pill person">person</span>';
+  if (f.pet_present)      pills += '<span class="pill pet">pet</span>';
+  if (f.vehicles_present) pills += '<span class="pill vehicle">vehicle</span>';
+
+  return `
+    <div class="card" data-fid="${fid}">
+      <div class="card-header">${cam || "(no camera)"} · ${fid}</div>
+      <div class="card-meta">${ts}</div>
+      <div>${pills}</div>
+      <div class="thumbs">
+        <img src="/media/frame/${fid}" data-src="/media/frame/${fid}" alt="frame">
+        <img src="/media/tagged/${fid}" data-src="/media/tagged/${fid}" alt="tagged">
+      </div>
+      <div><strong>Scene:</strong><br><pre>${scene}</pre></div>
+      ${people ? `<div><strong>People:</strong><br><pre>${people}</pre></div>` : ""}
+      ${pets   ? `<div><strong>Pets:</strong><br><pre>${pets}</pre></div>`     : ""}
+      ${veh    ? `<div><strong>Vehicles:</strong><br><pre>${veh}</pre></div>`  : ""}
+    </div>
+  `;
+}
+
+function attachThumbHandlers(containerId) {
+  const grid = byId(containerId);
+  grid.querySelectorAll('img').forEach(img => {
+    img.addEventListener('click', () => {
+      const src = img.getAttribute('data-src') || img.src;
+      const m   = byId('modal');
+      const mi  = byId('modal-img');
+      mi.src = src;
+      m.style.display = 'flex';
+    });
+  });
+}
+
+byId('modal-close').addEventListener('click', () => {
+  byId('modal').style.display = 'none';
+});
+
+byId('search-btn').addEventListener('click', async () => {
+  const q   = byId('search-q').value.trim();
+  const cam = byId('search-camera').value.trim();
+  const llm = byId('search-llm').checked;
+  const err = byId('search-error');
+  const grid = byId('search-grid');
+  const summary = byId('search-summary');
+
+  err.textContent = "";
+  grid.innerHTML = "";
+  summary.style.display = "none";
+  summary.textContent = "";
+
+  if (!q) {
+    err.textContent = "Please enter a query.";
+    return;
+  }
+
+  const params = new URLSearchParams({ q, k: "40" });
+  if (cam) params.append("cameras", cam);
+  if (llm) params.append("llm", "true");
+
+  try {
+    const res = await fetch("/api/search?" + params.toString());
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    const frames = data.frames || [];
+    if (!frames.length) {
+      err.textContent = "No results from RAG.";
+    } else {
+      grid.innerHTML = frames.map(cardHTML).join("");
+      attachThumbHandlers("search-grid");
+    }
+    if (data.summary) {
+      summary.style.display = "block";
+      summary.innerHTML = "<strong>LLM Summary:</strong> " + data.summary;
+    }
+  } catch (e) {
+    err.textContent = "Search error: " + e;
+  }
+});
+</script>
+</body>
+</html>
+"""
+
+# ---------------------------------------------------------------------
+# NDJSON helpers
+# ---------------------------------------------------------------------
+def _iter_ndjson(start_line: int = 0) -> Tuple[int, List[Dict[str, Any]]]:
+    total = 0
+    recs: List[Dict[str, Any]] = []
+    if not NDJSON.exists():
+        return 0, []
+    with NDJSON.open("r", encoding="utf-8") as fh:
+        for idx, line in enumerate(fh):
+            total = idx + 1
+            if idx < start_line:
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                recs.append(json.loads(line))
+            except Exception:
+                continue
+    return total, recs
+
+
+def _date_from_rec(rec: Dict[str, Any]) -> Optional[str]:
+    ts_raw = rec.get("ts") or rec.get("indexed_at")
+    if not ts_raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")).astimezone()
+        return dt.date().isoformat()
+    except Exception:
+        return None
+
+
+def _find_record(fid: str) -> Optional[Dict[str, Any]]:
+    if not NDJSON.exists():
+        return None
+    with NDJSON.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if rec.get("frame_id") == fid:
+                return rec
+    return None
+
+
+def _resolve_media(rec: Dict[str, Any], key: str) -> Optional[Path]:
+    files = rec.get("files") or {}
+    p = files.get(key)
+    if not p:
+        return None
+    pth = (ROOT / p).resolve()
+    return pth if pth.exists() else None
+
+
+def _shape_frame(rec: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "frame_id": rec.get("frame_id"),
+        "camera_id": rec.get("camera_id"),
+        "ts": rec.get("ts") or rec.get("indexed_at"),
+        "scene_text": rec.get("scene_text"),
+        "person_present": rec.get("person_present"),
+        "pet_present": rec.get("pet_present"),
+        "vehicles_present": rec.get("vehicles_present"),
+        "people": rec.get("people") or [],
+        "pets": rec.get("pets") or [],
+        "vehicles": rec.get("vehicles") or [],
+    }
+
+# ---------------------------------------------------------------------
+# LLM rerank + strict JSON summary
+# ---------------------------------------------------------------------
+async def _llm_rerank_and_summarize(
+    query: str, frames: List[Dict[str, Any]]
+) -> Tuple[List[Dict[str, Any]], str]:
+    if not frames:
+        return frames, ""
+
+    candidates = []
+    for f in frames:
+        candidates.append(
+            {
+                "frame_id": f.get("frame_id"),
+                "camera_id": f.get("camera_id"),
+                "ts": f.get("ts"),
+                "scene_text": (f.get("scene_text") or "")[:400],
+                "people": f.get("people") or [],
+                "pets": f.get("pets") or [],
+                "vehicles": f.get("vehicles") or [],
+            }
+        )
+
+    system_prompt = (
+        "You are an assistant that ranks and summarizes camera search results.\n"
+        "The user query describes people, pets, vehicles, objects, or activities. "
+        "You receive a list of candidate frames from security cameras.\n\n"
+        "Each candidate has fields: frame_id, camera_id, ts (timestamp), scene_text, people, pets, vehicles.\n"
+        "1) Rank the frame_ids from MOST relevant to LEAST relevant for the query.\n"
+        "2) Produce a short summary explaining how the results match or do not match the query:\n"
+        "   - If there are no exact matches (e.g. query is 'red car' but only red trucks appear), explicitly say so and mention the closest alternatives with their date/time/camera.\n"
+        "   - Suggest how the user could adjust or broaden their query when helpful.\n\n"
+        "Output STRICT JSON ONLY in this format:\n"
+        "{\"ordered_frame_ids\": [\"id1\",\"id2\",...], \"summary\": \"some explanation\"}\n"
+        "Do NOT output any other text outside this JSON.\n"
+        "If the user's query is in Thai, write the summary in Thai; otherwise respond in English."
+    )
+
+    user_payload = {"query": query, "candidates": candidates}
+
+    body = {
+        "model": LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+        ],
+        "stream": False,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(f"{OLLAMA_URL}/api/chat", json=body)
+            resp.raise_for_status()
+            data = resp.json()
+            text = (data.get("message") or {}).get("content") or ""
+    except Exception as e:
+        log.warning("LLM call failed: %s", e)
+        return frames, ""
+
+    # Try strict JSON first; if that fails, fall back to showing raw text as summary
+    raw_text = text.strip()
+    try:
+        s = raw_text
+        if not s.startswith("{"):
+            start = s.find("{")
+            end = s.rfind("}")
+            if start != -1 and end != -1:
+                s = s[start : end + 1]
+        parsed = json.loads(s)
+    except Exception as e:
+        log.warning("LLM output parse failed (strict JSON): %s | raw=%s", e, raw_text[:200])
+        # keep original ranking, but still surface something in UI
+        return frames, raw_text[:400]
+
+    order = parsed.get("ordered_frame_ids") or []
+    summary = parsed.get("summary") or ""
+
+    if not order:
+        return frames, summary
+
+    order_index = {fid: idx for idx, fid in enumerate(order)}
+
+    def key_fn(f: Dict[str, Any]) -> int:
+        fid = f.get("frame_id")
+        return order_index.get(fid, len(order_index) + 1)
+
+    frames_sorted = sorted(frames, key=key_fn)
+    return frames_sorted, summary
+
+# ---------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    html = INDEX_HTML.replace("__RAG_URL__", RAG_URL).replace(
+        "__LANDING__", str(LANDING_BASE)
+    )
+    return HTMLResponse(html)
+
+
+@app.get("/browse", response_class=HTMLResponse)
+async def browse_page():
+    html = (
+        BROWSE_HTML.replace("__LANDING__", str(LANDING_BASE))
+        .replace("__CAMERAS_JSON__", CAMERAS_JSON)
+    )
+    return HTMLResponse(html)
+
+
+@app.get("/search", response_class=HTMLResponse)
+async def search_page():
+    html = SEARCH_HTML.replace("__RAG_URL__", RAG_URL)
+    return HTMLResponse(html)
+
+
+@app.get("/api/browse/frames", response_class=JSONResponse)
+async def api_browse_frames(
+    date: str = Query(...),
+    camera_id: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=500),
+):
+    total, recs = _iter_ndjson(0)
+    _ = total  # not used yet
+    out: List[Dict[str, Any]] = []
+    for rec in recs:
+        d = _date_from_rec(rec)
+        if d != date:
+            continue
+        if camera_id and rec.get("camera_id") != camera_id:
+            continue
+        out.append(_shape_frame(rec))
+        if len(out) >= limit:
+            break
+    return JSONResponse({"frames": out})
+
+
+@app.get("/api/search", response_class=JSONResponse)
+async def api_search(
+    q: str = Query(...),
+    cameras: Optional[str] = None,
+    llm: bool = Query(False),
+    k: int = Query(40, ge=1, le=100),
+):
+    params = {"q": q, "k": str(k), "strict": "true"}
+    if cameras:
+        params["cameras"] = cameras
+
+    log.info("Vision search q=%s cameras=%s llm=%s", q, cameras, llm)
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.get(f"{RAG_URL}/rag/search", params=params)
+            r.raise_for_status()
+            payload = r.json()
+    except Exception as e:
+        log.error("RAG search error: %s", e)
+        raise HTTPException(status_code=502, detail=f"RAG search error: {e}")
+
+    frames = [_shape_frame(rec) for rec in payload.get("results", [])]
+    summary = ""
+
+    if llm and frames:
+        frames, summary = await _llm_rerank_and_summarize(q, frames)
+        frames = frames[:12]  # show only top N when LLM assist on
+
+    return JSONResponse({"frames": frames, "summary": summary})
+
+
+@app.get("/media/frame/{frame_id}")
+async def media_frame(frame_id: str):
+    rec = _find_record(frame_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="frame_id not found")
+    p = _resolve_media(rec, "frame")
+    if not p:
+        raise HTTPException(status_code=404, detail="frame.jpg not found")
+    return FileResponse(p, media_type="image/jpeg")
+
+
+@app.get("/media/tagged/{frame_id}")
+async def media_tagged(frame_id: str):
+    rec = _find_record(frame_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="frame_id not found")
+    p = _resolve_media(rec, "tagged")
+    if not p:
+        raise HTTPException(status_code=404, detail="tagged.jpg not found")
+    return FileResponse(p, media_type="image/jpeg")
+
+
+# ---------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------
+if __name__ == "__main__":
+    log.info("Vision web starting on %s:%d", WEB_HOST, WEB_PORT)
+    uvicorn.run(
+        "services.vision_web.main:app",
+        host=WEB_HOST,
+        port=WEB_PORT,
+        reload=False,
+        log_level=LOG_LEVEL.lower(),
+    )

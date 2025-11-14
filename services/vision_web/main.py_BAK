@@ -1,0 +1,581 @@
+from __future__ import annotations
+
+import json
+import html as _html
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any, List, Optional
+
+import httpx
+import uvicorn
+import yaml
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+
+from common.logging import get_logger
+
+# ---------------------------------------------------------------------
+# Config & logging
+# ---------------------------------------------------------------------
+ROOT = Path(__file__).resolve().parents[2]
+CFG_PATH = ROOT / "config" / "config.yaml"
+
+cfg: Dict[str, Any] = yaml.safe_load(CFG_PATH.read_text(encoding="utf-8")) if CFG_PATH.exists() else {}
+rt = cfg.get("runtime", {}) or {}
+rag_cfg = cfg.get("frames_rag", {}) or {}
+vw_cfg = cfg.get("vision_web", {}) or {}
+
+LOG_LEVEL = rt.get("log_level", "INFO")
+LOG_DIR   = Path(rt.get("log_dir", "logs")).resolve()
+log = get_logger("vision_web", log_dir=str(LOG_DIR), level=LOG_LEVEL)
+
+LANDING_BASE = (ROOT / rt.get("ingest_base", "data/landing")).resolve()
+NDJSON_PATH  = (ROOT / rag_cfg.get("ndjson_path", "data/index/frames.ndjson")).resolve()
+RAG_HOST     = rag_cfg.get("host", "127.0.0.1")
+RAG_PORT     = int(rag_cfg.get("port", 8080))
+RAG_URL      = f"http://{RAG_HOST}:{RAG_PORT}"
+
+WEB_HOST     = vw_cfg.get("host", "0.0.0.0")
+WEB_PORT     = int(vw_cfg.get("port", 8090))
+
+app = FastAPI(title="Server Vision Pipeline Web Console")
+
+# ---------------------------------------------------------------------
+# HTML template (only placeholder is {{LANDING_BASE}})
+# ---------------------------------------------------------------------
+HOME_HTML = r"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Server Vision Pipeline · Vision Console</title>
+  <style>
+    body {
+      background-color:#111;
+      color:#eee;
+      font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+      margin:0;
+      padding:0;
+    }
+    header {
+      padding:16px 24px;
+      background:#181818;
+      border-bottom:1px solid #222;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+    }
+    h1 { font-size:1.4rem; margin:0; color:#00c6ff; }
+    .sub { color:#9aa0a6; font-size:0.85rem; }
+    main { padding:16px 24px 32px; }
+    .mono { font-family:ui-monospace,Menlo,Consolas,monospace; }
+
+    .tabs { margin-top:8px; margin-bottom:16px; border-bottom:1px solid #222; }
+    .tab {
+      display:inline-block;
+      padding:8px 16px;
+      margin-right:8px;
+      cursor:pointer;
+      border-bottom:2px solid transparent;
+      color:#aaa;
+      font-size:0.95rem;
+    }
+    .tab.active {
+      color:#fff;
+      border-color:#00c6ff;
+    }
+    .panel { display:none; }
+    .panel.active { display:block; }
+
+    label { font-size:0.85rem; color:#9aa0a6; margin-right:8px; }
+    input[type="date"], input[type="text"] {
+      background:#1b1b1b;
+      border:1px solid #333;
+      border-radius:4px;
+      padding:4px 8px;
+      color:#eee;
+      font-size:0.9rem;
+      margin-right:8px;
+    }
+    button {
+      background:#00c6ff;
+      border:none;
+      color:#000;
+      border-radius:4px;
+      padding:6px 12px;
+      cursor:pointer;
+      font-size:0.9rem;
+      font-weight:600;
+    }
+    button:hover { background:#00a4d6; }
+
+    .frames-grid {
+      display:grid;
+      grid-template-columns:repeat(auto-fill,minmax(320px,1fr));
+      gap:16px;
+      margin-top:16px;
+    }
+    .frame-card {
+      background:#1a1a1a;
+      border:1px solid #262626;
+      border-radius:10px;
+      padding:10px;
+      display:flex;
+      flex-direction:column;
+      gap:8px;
+    }
+    .frame-card h3 {
+      margin:0;
+      font-size:0.9rem;
+      color:#66ccff;
+      word-break:break-all;
+    }
+    .meta-line { font-size:0.8rem; color:#9aa0a6; }
+
+    .thumbs {
+      display:flex;
+      gap:8px;
+      align-items:flex-start;
+    }
+    .thumbs img {
+      max-width:150px;
+      border-radius:6px;
+      border:1px solid #333;
+      cursor:pointer;
+    }
+
+    .desc {
+      font-size:0.8rem;
+      color:#e0e0e0;
+      white-space:pre-wrap;
+      max-height:120px;
+      overflow:auto;
+    }
+
+    .pill {
+      display:inline-block;
+      padding:2px 6px;
+      border-radius:999px;
+      font-size:0.8rem;
+      margin-right:4px;
+    }
+    .pill.green { background:#1b5e20; color:#c8e6c9; }
+    .pill.blue  { background:#1565c0; color:#bbdefb; }
+    .pill.grey  { background:#424242; color:#e0e0e0; }
+
+    .people-list, .pets-list, .veh-list {
+      font-size:0.8rem;
+      color:#9aa0a6;
+      margin-top:4px;
+      white-space:pre-wrap;
+    }
+
+    .error { color:#ef5350; font-size:0.9rem; margin-top:8px; }
+    .small { font-size:0.8rem; color:#9aa0a6; }
+
+    .modal-backdrop {
+      position:fixed;
+      inset:0;
+      background:rgba(0,0,0,0.6);
+      display:none;
+      align-items:center;
+      justify-content:center;
+      z-index:1000;
+    }
+    .modal-backdrop.active { display:flex; }
+    .modal-content {
+      background:#111;
+      border-radius:8px;
+      padding:8px;
+      border:1px solid #333;
+      max-width:90vw;
+      max-height:90vh;
+      box-shadow:0 10px 30px rgba(0,0,0,0.6);
+    }
+    .modal-content img {
+      max-width:100%;
+      max-height:85vh;
+      display:block;
+    }
+    .modal-close {
+      text-align:right;
+      margin-bottom:4px;
+    }
+    .modal-close button {
+      background:#333;
+      color:#eee;
+      border:none;
+      padding:4px 8px;
+      border-radius:4px;
+      font-size:0.8rem;
+      cursor:pointer;
+    }
+    .modal-close button:hover { background:#555; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Server Vision Pipeline</h1>
+      <div class="sub">Browse frames & run simple RAG queries</div>
+    </div>
+    <div class="sub">Landing: <span class="mono">{{LANDING_BASE}}</span></div>
+  </header>
+
+  <main>
+    <div class="tabs">
+      <div class="tab active" data-panel="browse">Browse</div>
+      <div class="tab" data-panel="search">Search</div>
+    </div>
+
+    <section id="panel-browse" class="panel active">
+      <div>
+        <label for="browse-date">Date</label>
+        <input type="date" id="browse-date"/>
+        <label for="browse-camera">Camera</label>
+        <input type="text" id="browse-camera" placeholder="e.g. front_gate / dining"/>
+        <button id="browse-load">Load Frames</button>
+      </div>
+      <div class="small">Tip: leave camera empty to see all cameras for that date.</div>
+      <div id="browse-error" class="error"></div>
+      <div id="browse-results" class="frames-grid"></div>
+    </section>
+
+    <section id="panel-search" class="panel">
+      <div>
+        <label for="search-q">Query</label>
+        <input type="text" id="search-q" placeholder="e.g. pink car, person carrying a baby, people eating at dining table"/>
+        <label for="search-camera">Camera</label>
+        <input type="text" id="search-camera" placeholder="optional camera_id filter"/>
+        <button id="search-run">Search</button>
+      </div>
+      <div class="small">Uses RAG semantic search via /rag/search.</div>
+      <div id="search-error" class="error"></div>
+      <div id="search-results" class="frames-grid"></div>
+    </section>
+  </main>
+
+  <div id="modal" class="modal-backdrop">
+    <div class="modal-content">
+      <div class="modal-close"><button id="modal-close-btn">Close ✕</button></div>
+      <img id="modal-img" src="" alt="full"/>
+    </div>
+  </div>
+
+<script>
+// helpers
+function byId(id) { return document.getElementById(id); }
+
+// tabs
+const tabs = document.querySelectorAll('.tab');
+const panels = {
+  browse: byId('panel-browse'),
+  search: byId('panel-search')
+};
+tabs.forEach(t => {
+  t.addEventListener('click', () => {
+    tabs.forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+    const p = t.getAttribute('data-panel');
+    Object.keys(panels).forEach(k => panels[k].classList.remove('active'));
+    panels[p].classList.add('active');
+  });
+});
+
+// modal
+const modal    = byId('modal');
+const modalImg = byId('modal-img');
+byId('modal-close-btn').addEventListener('click', closeModal);
+modal.addEventListener('click', ev => { if (ev.target === modal) closeModal(ev); });
+
+function openModal(src) {
+  modalImg.src = src;
+  modal.classList.add('active');
+}
+function closeModal(ev) {
+  ev.preventDefault();
+  modal.classList.remove('active');
+}
+
+// escape
+function esc(str) {
+  if (str === null || str === undefined) return '';
+  return String(str)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;');
+}
+
+// render frames
+function frameCardHtml(f) {
+  const frameId = esc(f.frame_id);
+  const cam     = esc(f.camera_id);
+  const ts      = esc(f.ts || '');
+  const scene   = esc(f.scene_text || '');
+
+  const hasPerson = !!f.person_present;
+  const hasPet    = !!f.pet_present;
+  const hasVeh    = !!f.vehicles_present;
+
+  const people = Array.isArray(f.people) ? f.people : [];
+  const pets   = Array.isArray(f.pets) ? f.pets : [];
+  const veh    = Array.isArray(f.vehicles) ? f.vehicles : [];
+
+  const peopleLines = esc(people.map(x => '- ' + x).join('\n'));
+  const petLines    = esc(pets.map(x => '- ' + x).join('\n'));
+  const vehLines    = esc(veh.map(x => '- ' + x).join('\n'));
+
+  let chips = '';
+  if (hasPerson) chips += '<span class="pill green">person</span>';
+  if (hasPet)    chips += '<span class="pill blue">pet</span>';
+  if (hasVeh)    chips += '<span class="pill grey">vehicle</span>';
+
+  let html = '';
+  html += '<article class="frame-card">';
+  html += '<h3>' + cam + ' · ' + frameId + '</h3>';
+  html += '<div class="meta-line">' + ts + '</div>';
+  html += '<div>' + chips + '</div>';
+  html += '<div class="thumbs">';
+  html += '<img class="thumb" data-src="/media/frame/' + frameId  + '" src="/media/frame/' + frameId  + '" alt="frame"  title="frame"/>';
+  html += '<img class="thumb" data-src="/media/tagged/' + frameId + '" src="/media/tagged/' + frameId + '" alt="tagged" title="tagged overlay"/>';
+  html += '</div>';
+  html += '<div class="desc">' + scene + '</div>';
+  if (peopleLines) html += '<div class="people-list"><strong>People:</strong><br>'   + peopleLines + '</div>';
+  if (petLines)    html += '<div class="pets-list"><strong>Pets:</strong><br>'     + petLines    + '</div>';
+  if (vehLines)    html += '<div class="veh-list"><strong>Vehicles:</strong><br>' + vehLines    + '</div>';
+  html += '</article>';
+  return html;
+}
+
+function renderFrames(grid, frames) {
+  grid.innerHTML = frames.map(frameCardHtml).join('');
+  const thumbs = grid.querySelectorAll('.thumb');
+  thumbs.forEach(img => {
+    img.addEventListener('click', () => {
+      const src = img.getAttribute('data-src');
+      openModal(src);
+    });
+  });
+}
+
+// browse
+async function loadBrowse() {
+  const dateEl = byId('browse-date');
+  const camEl  = byId('browse-camera');
+  const errEl  = byId('browse-error');
+  const grid   = byId('browse-results');
+
+  errEl.textContent = '';
+  grid.innerHTML = '';
+
+  if (!dateEl.value) {
+    errEl.textContent = 'Please select a date.';
+    return;
+  }
+  const params = new URLSearchParams({ date: dateEl.value });
+  if (camEl.value.trim()) params.append('camera_id', camEl.value.trim());
+
+  try {
+    const res = await fetch('/api/browse/frames?' + params.toString());
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    if (!data.frames || data.frames.length === 0) {
+      grid.innerHTML = '<div class="small">No frames found for that date/camera.</div>';
+      return;
+    }
+    renderFrames(grid, data.frames);
+  } catch (e) {
+    errEl.textContent = 'Browse error: ' + e;
+  }
+}
+document.getElementById('browse-load').addEventListener('click', loadBrowse);
+
+// search
+async function runSearch() {
+  const qEl   = byId('search-q');
+  const camEl = byId('search-camera');
+  const errEl = byId('search-error');
+  const grid  = byId('search-results');
+
+  errEl.textContent = '';
+  grid.innerHTML = '';
+
+  const q = qEl.value.trim();
+  if (!q) {
+    errEl.textContent = 'Please enter a query.';
+    return;
+  }
+  const params = new URLSearchParams({ q: q, k: '20' });
+  if (camEl.value.trim()) params.append('cameras', camEl.value.trim());
+
+  try {
+    const res = await fetch('/api/search?' + params.toString());
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    if (!data.frames || data.frames.length === 0) {
+      grid.innerHTML = '<div class="small">No results.</div>';
+      return;
+    }
+    renderFrames(grid, data.frames);
+  } catch (e) {
+    errEl.textContent = 'Search error: ' + e;
+  }
+}
+document.getElementById('search-run').addEventListener('click', runSearch);
+</script>
+</body>
+</html>
+"""
+
+# ---------------------------------------------------------------------
+# NDJSON & file helpers
+# ---------------------------------------------------------------------
+def _iter_ndjson() -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    if not NDJSON_PATH.exists():
+        log.warning("NDJSON not found: %s", NDJSON_PATH)
+        return records
+    with NDJSON_PATH.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except Exception:
+                continue
+    return records
+
+def _date_from_record(rec: Dict[str, Any]) -> Optional[str]:
+    ts_raw = rec.get("ts") or rec.get("indexed_at")
+    if not ts_raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+        return dt.date().isoformat()
+    except Exception:
+        return None
+
+def _find_record_by_frame_id(frame_id: str) -> Optional[Dict[str, Any]]:
+    if not NDJSON_PATH.exists():
+        return None
+    with NDJSON_PATH.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if rec.get("frame_id") == frame_id:
+                return rec
+    return None
+
+def _resolve_file_from_rec(rec: Dict[str, Any], key: str) -> Optional[Path]:
+    files = rec.get("files", {}) or {}
+    path_str = files.get(key)
+    if not path_str:
+        return None
+    p = Path(path_str)
+    if not p.is_absolute():
+        p = (ROOT / path_str).resolve()
+    return p if p.exists() else None
+
+def _shape_frame(rec: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "frame_id": rec.get("frame_id"),
+        "camera_id": rec.get("camera_id"),
+        "ts": rec.get("ts") or rec.get("indexed_at"),
+        "scene_text": rec.get("scene_text"),
+        "person_present": rec.get("person_present"),
+        "pet_present": rec.get("pet_present"),
+        "vehicles_present": rec.get("vehicles_present"),
+        "people": rec.get("people") or [],
+        "pets": rec.get("pets") or [],
+        "vehicles": rec.get("vehicles") or [],
+    }
+
+# ---------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------
+@app.get("/", response_class=HTMLResponse)
+async def home():
+    html = HOME_HTML.replace("{{LANDING_BASE}}", _html.escape(str(LANDING_BASE)))
+    return HTMLResponse(html)
+
+@app.get("/api/browse/frames", response_class=JSONResponse)
+async def api_browse_frames(
+    date: str = Query(..., description="Date in YYYY-MM-DD"),
+    camera_id: Optional[str] = Query(None, description="Optional camera_id filter"),
+    limit: int = Query(100, ge=1, le=500),
+):
+    recs = _iter_ndjson()
+    out: List[Dict[str, Any]] = []
+    for rec in recs:
+        d = _date_from_record(rec)
+        if d != date:
+            continue
+        if camera_id and rec.get("camera_id") != camera_id:
+            continue
+        out.append(_shape_frame(rec))
+        if len(out) >= limit:
+            break
+    return JSONResponse({"frames": out})
+
+@app.get("/api/search", response_class=JSONResponse)
+async def api_search(
+    q: str = Query(..., description="Free text query"),
+    cameras: Optional[str] = Query(None, description="Comma-separated camera_ids"),
+    start: Optional[int] = Query(None),
+    end: Optional[int] = Query(None),
+    k: int = Query(20, ge=1, le=100),
+):
+    params = {"q": q, "k": str(k)}
+    if cameras:
+        params["cameras"] = cameras
+    if start is not None:
+        params["start"] = str(start)
+    if end is not None:
+        params["end"] = str(end)
+
+    log.info("Proxy search q='%s' cameras=%s", q, cameras)
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.get(f"{RAG_URL}/rag/search", params=params)
+            r.raise_for_status()
+            payload = r.json()
+    except Exception as e:
+        log.error("RAG search failed: %s", e)
+        raise HTTPException(status_code=502, detail=f"RAG search error: {e}")
+
+    frames = [_shape_frame(rec) for rec in payload.get("results", [])]
+    return JSONResponse({"frames": frames})
+
+@app.get("/media/frame/{frame_id}")
+async def media_frame(frame_id: str):
+    rec = _find_record_by_frame_id(frame_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="frame_id not found")
+    p = _resolve_file_from_rec(rec, "frame")
+    if not p:
+        raise HTTPException(status_code=404, detail="frame.jpg not found")
+    return FileResponse(p, media_type="image/jpeg")
+
+@app.get("/media/tagged/{frame_id}")
+async def media_tagged(frame_id: str):
+    rec = _find_record_by_frame_id(frame_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="frame_id not found")
+    p = _resolve_file_from_rec(rec, "tagged")
+    if not p:
+        raise HTTPException(status_code=404, detail="tagged.jpg not found")
+    return FileResponse(p, media_type="image/jpeg")
+
+# ---------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------
+if __name__ == "__main__":
+    log.info("Vision Web Console starting on %s:%d (landing=%s)", WEB_HOST, WEB_PORT, LANDING_BASE)
+    uvicorn.run("services.vision_web.main:app",
+                host=WEB_HOST, port=WEB_PORT,
+                reload=False, log_level=LOG_LEVEL.lower())

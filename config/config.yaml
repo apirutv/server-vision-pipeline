@@ -1,0 +1,94 @@
+rag:
+  chroma_path: "data/vectors"            # persisted Chroma store
+  collection: "frames"
+  embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+
+ingest:
+  # Option A: scan a shared folder of description JSONs (copied from edge)
+  watch_dirs:
+    - "/mnt/edge_share/outputs"          # mount the PI’s outputs here (smb/nfs/rsync)
+  glob: "**/described/*.json"
+  scan_interval_sec: 10
+
+  # Option B: (optional) subscribe to Redis stream if you forward frames.described
+  redis_url: "redis://127.0.0.1:6379/0"
+  stream_described: "frames.described"   # if unused, leave as-is
+
+api:
+  host: "0.0.0.0"
+  port: 8010
+
+# server-vision-pipeline/config/config.yaml
+runtime:
+  redis_url: "redis://127.0.0.1:6379/0"
+  ingest_base: "/home/apirut/python_projects/server-vision-pipeline/data/landing"   # <-- set your desired folder (typo? use /srv/ingest/landing)
+  host: "0.0.0.0"
+  port: 8000
+  log_level: "INFO"
+  log_dir: "logs"                       # where rotating logs are written
+
+indexer:
+  runtime:
+    redis_url: "redis://127.0.0.1:6379/0"   # server’s Redis (where ingest_api publishes frames.ingested)
+    stream_in: "frames.ingested"
+    group: "indexer-worker"
+    consumer: "ix-01"
+    batch_size: 32
+    block_ms: 5000
+    min_idle_ms: 5000
+    drain_history: true
+    dlq_stream: "frames.indexer.dlq"
+  out_path: "data/index/frames.ndjson"
+  seen_path: "data/index/.seen_ids.txt"
+  enrich_from_files: true
+
+frames_rag:
+  ndjson_path: "data/index/frames.ndjson"
+  db_path: "data/rag/frames.sqlite"
+  faiss_path: "data/rag/faiss.index"
+  ids_path: "data/rag/ids.json"
+
+  # --- OLLAMA embedding config ---
+  ollama_url: "http://127.0.0.1:11434"     # Ollama server endpoint
+  embed_model: "nomic-embed-text"          # embedding model name
+
+  # service bind
+  host: "0.0.0.0"
+  port: 8080
+  
+vision_reasoner:
+  host: "0.0.0.0"
+  port: 8011
+
+  ollama_url: "http://127.0.0.1:11434"
+  #ollama_model: "qwen2.5:7b-instruct"
+  ollama_model: "gpt-oss:latest"
+  clarify_threshold: 0.6
+
+  timezone: "Asia/Bangkok"
+
+  # where to load camera + zone metadata for inference
+  cameras_config: "config/cameras.yaml"
+  zones_config: "config/zones.yaml"
+
+vision_web:
+  host: "0.0.0.0"
+  port: 8090
+  #llm_model: "gpt-oss:latest"
+  #llm_model: "Qwen2.5:7B-Instruct"
+  #llm_model: "llama3:latest "
+  #llm_model: "deepseek-r1:7b"
+
+  # "local" = use Ollama; "openai" = use OpenAI first, fall back to Ollama
+  llm_mode: "openai"
+  #llm_mode: "local"
+
+  # Local LLM (Ollama)
+  ollama_url: "http://127.0.0.1:11434"
+  #local_model: "gpt-oss:latest"
+  #local_model: "Qwen2.5:7B-Instruct"
+  #local_model: "Qwen2.5:14b-instruct"
+
+  # OpenAI
+  openai_model: "gpt-4.1-mini"
+  
